@@ -1019,6 +1019,68 @@ gst_va_compositor_copy_output_buffer (GstVaCompositor * self,
   return TRUE;
 }
 
+/* Whether any sink pad contributes a sample this frame. */
+static gboolean
+gst_va_compositor_has_sample (GstVaCompositor * self)
+{
+  GList *l;
+
+  for (l = GST_ELEMENT (self)->sinkpads; l; l = l->next) {
+    if (gst_video_aggregator_pad_has_current_buffer (GST_VIDEO_AGGREGATOR_PAD
+            (l->data)))
+      return TRUE;
+  }
+
+  return FALSE;
+}
+
+/* Paints the output black when no pad contributes a sample.
+ *
+ * VA never writes the output surface in that case: gst_va_filter_compose()
+ * issues vaBeginPicture()/vaEndPicture() with no vaRenderPicture() between
+ * them, and the background colour rides in the per-sample
+ * VAProcPipelineParameterBuffer, so with zero samples nothing paints it. The
+ * buffer then carries whatever the pool handed out, and a zeroed YUV surface is
+ * solid green rather than black. A live compositor is starved exactly like this
+ * while its inputs are still connecting, so without this the green reaches the
+ * encoder.
+ */
+static gboolean
+gst_va_compositor_clear_output (GstVaCompositor * self, GstBuffer * buffer)
+{
+  GstVideoAggregator *vagg = GST_VIDEO_AGGREGATOR (self);
+  GstVideoFrame frame;
+  gboolean is_yuv;
+  guint i;
+
+  if (!gst_video_frame_map (&frame, &vagg->info, buffer, GST_MAP_WRITE)) {
+    GST_ERROR_OBJECT (self, "couldn't map the output buffer to clear it");
+    return FALSE;
+  }
+
+  is_yuv = GST_VIDEO_FORMAT_INFO_IS_YUV (frame.info.finfo);
+
+  for (i = 0; i < GST_VIDEO_FRAME_N_PLANES (&frame); i++) {
+    guint8 *data = GST_VIDEO_FRAME_PLANE_DATA (&frame, i);
+    gint stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, i);
+    guint height = GST_VIDEO_FRAME_COMP_HEIGHT (&frame, i);
+    guint8 fill;
+
+    /* Luma black is 0x10 and neutral chroma is 0x80. A zeroed chroma plane is
+     * precisely what makes an uncleared surface green. */
+    if (is_yuv)
+      fill = (i == 0) ? 0x10 : 0x80;
+    else
+      fill = 0x00;
+
+    memset (data, fill, (gsize) stride * height);
+  }
+
+  gst_video_frame_unmap (&frame);
+
+  return TRUE;
+}
+
 static GstFlowReturn
 gst_va_compositor_aggregate_frames (GstVideoAggregator * vagg,
     GstBuffer * outbuf)
@@ -1028,7 +1090,21 @@ gst_va_compositor_aggregate_frames (GstVideoAggregator * vagg,
   GstVaComposeTransaction tx;
   GstBuffer *vabuffer;
   gboolean need_copy = FALSE;
+  gboolean have_sample;
   GstFlowReturn ret = GST_FLOW_OK;
+
+  GST_OBJECT_LOCK (self);
+  have_sample = gst_va_compositor_has_sample (self);
+  GST_OBJECT_UNLOCK (self);
+
+  /* Nothing to blend. Paint the buffer the aggregator handed us and ship that,
+   * rather than whatever the pool happened to contain. Done before anything
+   * takes a second ref, because mapping for write needs a writable buffer. */
+  if (!have_sample) {
+    if (!gst_va_compositor_clear_output (self, outbuf))
+      return GST_FLOW_ERROR;
+    return GST_FLOW_OK;
+  }
 
   if (self->other_pool) {
     /* create a va buffer for filter */
