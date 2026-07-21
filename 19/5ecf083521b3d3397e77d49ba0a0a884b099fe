@@ -1,0 +1,23 @@
+subprojects/gst-plugins-bad/sys/va/gstvacompositor.c
+  s_108af9614c9c73::t_7e25da3113478f 962
+subprojects/gst-plugins-bad/sys/va/gstvafilter.c
+  s_108af9614c9c73::t_514e6cd5e50a46 1862-1869,1872-1873,1875-1876
+subprojects/gst-plugins-bad/sys/va/gstvafilter.h
+  s_108af9614c9c73::t_e195a63e75335c 97-100
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "195ecf083521b3d3397e77d49ba0a0a884b099fe",
+  "prompts": {},
+  "sessions": {
+    "s_108af9614c9c73": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d8854bae-43ef-4746-94cd-76535f90602a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "datagutt <datagutt@lekanger.no>"
+    }
+  }
+}
