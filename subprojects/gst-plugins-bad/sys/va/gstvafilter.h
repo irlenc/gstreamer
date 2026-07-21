@@ -94,6 +94,10 @@ struct _GstVaComposeSample
   VARectangle output_region;
 
   gdouble alpha;
+
+  /* blend this sample by its own alpha channel, per pixel, on top of any
+   * global alpha; set for a sample whose format carries alpha */
+  gboolean per_pixel_alpha;
 };
 
 typedef struct _GstVaComposeTransaction GstVaComposeTransaction;

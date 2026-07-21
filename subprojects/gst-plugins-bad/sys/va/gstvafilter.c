@@ -1859,17 +1859,21 @@ gst_va_filter_compose (GstVaFilter * self, GstVaComposeTransaction * tx)
     /* *INDENT-ON* */
     GST_OBJECT_UNLOCK (self);
 
-    /* only send blend state when sample is not fully opaque */
+    /* Only send blend state when the sample is not fully opaque. Per-pixel and
+     * global alpha combine: a semi-transparent overlay on a pad faded to 0.5
+     * blends by both. VA-API has no straight-alpha blend mode, so a per-pixel
+     * sample has to arrive premultiplied. */
+    if ((self->pipeline_caps.blend_flags & VA_BLEND_PREMULTIPLIED_ALPHA)
+        && sample->per_pixel_alpha) {
+      blend.flags |= VA_BLEND_PREMULTIPLIED_ALPHA;
+    }
     if ((self->pipeline_caps.blend_flags & VA_BLEND_GLOBAL_ALPHA)
         && sample->alpha < 1.0) {
-      /* *INDENT-OFF* */
-      blend = (VABlendState) {
-        .flags = VA_BLEND_GLOBAL_ALPHA,
-        .global_alpha = sample->alpha,
-      };
-      /* *INDENT-ON* */
-      params.blend_state = &blend;
+      blend.flags |= VA_BLEND_GLOBAL_ALPHA;
+      blend.global_alpha = sample->alpha;
     }
+    if (blend.flags != 0)
+      params.blend_state = &blend;
 
     status = vaCreateBuffer (dpy, self->context,
         VAProcPipelineParameterBufferType, sizeof (params), 1, &params,
