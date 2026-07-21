@@ -975,6 +975,7 @@ gst_va_compositor_sample_next (gpointer data)
             ? GST_VIDEO_INFO_HEIGHT (&vaggpad->info) : pad->height,
       },
       .alpha = pad->alpha,
+      .premultiplied_alpha = GST_VIDEO_INFO_HAS_ALPHA (&vaggpad->info),
     };
     /* *INDENT-ON* */
     GST_OBJECT_UNLOCK (vaggpad);
