@@ -1,0 +1,44 @@
+subprojects/gst-plugins-bad/sys/va/gstvadecoder.c
+  s_d40794603f0ec1::t_9c2f701f0c78dd 223-253,257-259,261,277-279,281-282
+  s_d40794603f0ec1::t_6e255d4d285a0a 48-50
+subprojects/gst-plugins-bad/sys/va/gstvabasedec.c
+  s_d40794603f0ec1::t_7ba802226cd372 824
+  s_d40794603f0ec1::t_eac8d660598d9b 53-76
+  s_d40794603f0ec1::t_212700aa775db9 842-867
+  s_d40794603f0ec1::t_5a128b0eb8ef45 1236-1275
+  s_d40794603f0ec1::t_aebef9a20a35c2 724-761
+  s_d40794603f0ec1::t_b3623379787568 23-24
+subprojects/gst-plugins-bad/sys/va/gstvabasedec.h
+  s_d40794603f0ec1::t_aac92c2fdb02a4 46-47
+  s_d40794603f0ec1::t_5235414cbafada 97-111
+  s_d40794603f0ec1::t_7b4572a427cf7c 167-169
+subprojects/gst-plugins-bad/sys/va/gstvah264dec.c
+  s_d40794603f0ec1::t_e1ec7263e8f59f 112-113
+  s_d40794603f0ec1::t_af7668015ef93c 163-167
+  s_d40794603f0ec1::t_9dc63c0671c0e7 504-509
+subprojects/gst-plugins-bad/gst-libs/gst/va/gstvaallocator.c
+  s_d40794603f0ec1::t_a57f8fcf0b98eb 2146,2148-2149,2152-2155,2163-2164,2200-2202,2215-2217
+  s_d40794603f0ec1::t_ac9ca54d98a739 2237-2256
+subprojects/gst-plugins-bad/sys/va/gstvadecoder.h
+  s_d40794603f0ec1::t_4320c89b2fa794 44-47
+subprojects/gst-plugins-bad/gst-libs/gst/va/gstvaallocator.h
+  s_d40794603f0ec1::t_1e581053955e0d 132-135
+subprojects/gst-plugins-bad/sys/va/gstvah265dec.c
+  s_d40794603f0ec1::t_52835efbe704a8 212-213,295-299,871-877
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "3b80baa1d533f6ad0a42a6e16e02ae9214b228f3",
+  "prompts": {},
+  "sessions": {
+    "s_d40794603f0ec1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d6e5fa40-053c-4a23-b20e-d945e039f17c",
+        "model": "claude-fable-5"
+      },
+      "human_author": "datagutt <datagutt@lekanger.no>"
+    }
+  }
+}
