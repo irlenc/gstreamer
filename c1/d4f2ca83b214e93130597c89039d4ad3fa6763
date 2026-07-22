@@ -1,0 +1,19 @@
+subprojects/gst-plugins-bad/sys/va/gstvabasedec.c
+  s_d40794603f0ec1::t_0257324b7c4882 162-168
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "c1d4f2ca83b214e93130597c89039d4ad3fa6763",
+  "prompts": {},
+  "sessions": {
+    "s_d40794603f0ec1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d6e5fa40-053c-4a23-b20e-d945e039f17c",
+        "model": "claude-fable-5"
+      },
+      "human_author": "datagutt <datagutt@lekanger.no>"
+    }
+  }
+}
