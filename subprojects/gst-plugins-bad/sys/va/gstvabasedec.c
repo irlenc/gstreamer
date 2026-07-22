@@ -159,6 +159,13 @@ gst_va_base_dec_getcaps (GstVideoDecoder * decoder, GstCaps * filter)
     gst_object_unref (va_decoder);
   }
 
+  /* With decode-time SFC scaling requested, the coded size is decoupled
+   * from the downstream size, so the proxy must not transplant downstream
+   * size restrictions onto the sink: a 1080p stream into a decoder scaling
+   * to 720p is exactly the point. Answer with the template instead. */
+  if (!caps && base->sfc_width > 0 && base->sfc_height > 0)
+    caps = gst_pad_get_pad_template_caps (GST_VIDEO_DECODER_SINK_PAD (decoder));
+
   if (caps) {
     if (filter) {
       tmp = gst_caps_intersect_full (filter, caps, GST_CAPS_INTERSECT_FIRST);
