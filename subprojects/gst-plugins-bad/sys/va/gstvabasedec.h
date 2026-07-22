@@ -43,6 +43,8 @@ G_BEGIN_DECLS
 
 enum {
   GST_VA_DEC_PROP_DEVICE_PATH = 1,
+  GST_VA_DEC_PROP_SFC_WIDTH,
+  GST_VA_DEC_PROP_SFC_HEIGHT,
   GST_VA_DEC_PROP_LAST,
 };
 
@@ -91,6 +93,21 @@ struct _GstVaBaseDec
   GstVideoConverter *convert;
 
   gboolean need_negotiation;
+
+  /* Decode-time scaling on the fixed-function SFC (VD-SFC). The requested
+   * output size arrives via the sfc-width/sfc-height properties (0 disables);
+   * apply_sfc goes TRUE when the driver supports decode processing for the
+   * negotiated profile and the target is a downscale. The DPB then lives on
+   * per-buffer aux surfaces at coded size while the negotiated output pool
+   * carries the scaled size. The regions and target surface back the
+   * per-frame VAProcPipelineParameterBuffer: the driver dereferences them at
+   * decode submission, so they must outlive the call that filled them. */
+  guint sfc_width;
+  guint sfc_height;
+  gboolean apply_sfc;
+  VARectangle sfc_input_region;
+  VARectangle sfc_output_region;
+  VASurfaceID sfc_surface;
 
   guint32 hacks;
 };
@@ -147,5 +164,8 @@ gboolean              gst_va_base_dec_process_output      (GstVaBaseDec * base,
 GstFlowReturn         gst_va_base_dec_prepare_output_frame (GstVaBaseDec * base,
                                                             GstVideoCodecFrame * frame);
 gboolean              gst_va_base_dec_set_output_state    (GstVaBaseDec * base);
+gboolean              gst_va_base_dec_sfc_prepare         (GstVaBaseDec * base,
+                                                           GstVaDecodePicture * pic,
+                                                           GstBuffer * buffer);
 
 G_END_DECLS

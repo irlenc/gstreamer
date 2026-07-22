@@ -209,7 +209,8 @@ gst_va_h265_dec_end_picture (GstH265Decoder * decoder, GstH265Picture * picture)
     return GST_FLOW_ERROR;
   }
 
-  ret = gst_va_decoder_decode (base->decoder, va_pic);
+  ret = gst_va_decoder_decode_with_aux_surface (base->decoder, va_pic,
+      base->apply_sfc);
   if (!ret) {
     GST_ERROR_OBJECT (self, "Failed at end picture %p, (poc %d)",
         picture, picture->pic_order_cnt);
@@ -291,7 +292,11 @@ _fill_vaapi_pic (GstH265Decoder * decoder, VAPictureHEVC * va_picture,
     return;
   }
 
-  va_picture->picture_id = gst_va_decode_picture_get_surface (va_pic);
+  /* Under SFC decode scaling the aux surface is the decode render target
+   * and DPB entry; it only exists in that mode, so preferring it is safe. */
+  va_picture->picture_id = gst_va_decode_picture_get_aux_surface (va_pic);
+  if (va_picture->picture_id == VA_INVALID_ID)
+    va_picture->picture_id = gst_va_decode_picture_get_surface (va_pic);
   va_picture->pic_order_cnt = picture->pic_order_cnt;
   va_picture->flags = 0;
 
@@ -863,6 +868,13 @@ gst_va_h265_dec_new_picture (GstH265Decoder * decoder,
     goto error;
 
   pic = gst_va_decode_picture_new (base->decoder, output_buffer);
+
+  if (!gst_va_base_dec_sfc_prepare (base, pic, output_buffer)) {
+    gst_va_decode_picture_free (pic);
+    gst_buffer_unref (output_buffer);
+    goto error;
+  }
+
   gst_buffer_unref (output_buffer);
 
   gst_h265_picture_set_user_data (picture, pic,

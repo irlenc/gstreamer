@@ -41,6 +41,10 @@ GstVaDecoder *        gst_va_decoder_new                  (GstVaDisplay * displa
 gboolean              gst_va_decoder_open                 (GstVaDecoder * self,
                                                            VAProfile profile,
                                                            guint rt_format);
+gboolean              gst_va_decoder_has_processing       (GstVaDecoder * self,
+                                                           VAProfile profile);
+void                  gst_va_decoder_enable_processing    (GstVaDecoder * self,
+                                                           gboolean enable);
 gboolean              gst_va_decoder_close                (GstVaDecoder * self);
 gboolean              gst_va_decoder_is_open              (GstVaDecoder * self);
 gboolean              gst_va_decoder_set_frame_size_with_surfaces

@@ -2143,21 +2143,25 @@ gst_va_buffer_get_surface (GstBuffer * buffer)
 }
 
 /**
- * gst_va_buffer_create_aux_surface:
+ * gst_va_buffer_create_aux_surface_full:
  * @buffer: a #GstBuffer
+ * @width: surface width, or 0 for the allocator's width
+ * @height: surface height, or 0 for the allocator's height
  *
  * Creates a new VASurfaceID with @buffer's allocator and attached it
- * to it.
+ * to it. A non-zero @width/@height overrides the allocator's size, for
+ * decoders whose decode surface differs from the negotiated output
+ * (decode-time scaling on the SFC keeps the DPB at coded size while the
+ * output buffers are scaled).
  *
  * *This method is used only by plugin's internal VA decoder.*
  *
  * Returns: %TRUE if the new VASurfaceID is attached to @buffer
  *     correctly; %FALSE, otherwise.
- *
- * Since: 1.22
  */
 gboolean
-gst_va_buffer_create_aux_surface (GstBuffer * buffer)
+gst_va_buffer_create_aux_surface_full (GstBuffer * buffer, guint width,
+    guint height)
 {
   GstMemory *mem;
   VASurfaceID surface = VA_INVALID_ID;
@@ -2193,9 +2197,9 @@ gst_va_buffer_create_aux_surface (GstBuffer * buffer)
 
     display = self->display;
     if (!va_create_surfaces (self->display, rt_format, fourcc,
-            GST_VIDEO_INFO_WIDTH (&self->info.vinfo),
-            GST_VIDEO_INFO_HEIGHT (&self->info.vinfo), self->usage_hint, NULL,
-            0, NULL, &surface, 1))
+            width ? width : GST_VIDEO_INFO_WIDTH (&self->info.vinfo),
+            height ? height : GST_VIDEO_INFO_HEIGHT (&self->info.vinfo),
+            self->usage_hint, NULL, 0, NULL, &surface, 1))
       return FALSE;
   } else if (GST_IS_VA_ALLOCATOR (mem->allocator)) {
     GstVaAllocator *self = GST_VA_ALLOCATOR (mem->allocator);
@@ -2208,9 +2212,9 @@ gst_va_buffer_create_aux_surface (GstBuffer * buffer)
     display = self->display;
     format = GST_VIDEO_INFO_FORMAT (&self->info);
     if (!va_create_surfaces (self->display, self->rt_format, self->fourcc,
-            GST_VIDEO_INFO_WIDTH (&self->info),
-            GST_VIDEO_INFO_HEIGHT (&self->info), self->usage_hint, NULL, 0,
-            NULL, &surface, 1))
+            width ? width : GST_VIDEO_INFO_WIDTH (&self->info),
+            height ? height : GST_VIDEO_INFO_HEIGHT (&self->info),
+            self->usage_hint, NULL, 0, NULL, &surface, 1))
       return FALSE;
   } else {
     g_assert_not_reached ();
@@ -2228,6 +2232,26 @@ gst_va_buffer_create_aux_surface (GstBuffer * buffer)
       gst_va_buffer_surface_unref);
 
   return TRUE;
+}
+
+/**
+ * gst_va_buffer_create_aux_surface:
+ * @buffer: a #GstBuffer
+ *
+ * Creates a new VASurfaceID with @buffer's allocator, at the
+ * allocator's size, and attaches it to @buffer.
+ *
+ * *This method is used only by plugin's internal VA decoder.*
+ *
+ * Returns: %TRUE if the new VASurfaceID is attached to @buffer
+ *     correctly; %FALSE, otherwise.
+ *
+ * Since: 1.22
+ */
+gboolean
+gst_va_buffer_create_aux_surface (GstBuffer * buffer)
+{
+  return gst_va_buffer_create_aux_surface_full (buffer, 0, 0);
 }
 
 /**

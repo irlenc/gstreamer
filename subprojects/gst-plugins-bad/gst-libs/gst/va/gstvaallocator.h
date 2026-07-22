@@ -129,6 +129,10 @@ VASurfaceID           gst_va_buffer_get_surface           (GstBuffer * buffer);
 GST_VA_API
 gboolean              gst_va_buffer_create_aux_surface    (GstBuffer * buffer);
 GST_VA_API
+gboolean              gst_va_buffer_create_aux_surface_full (GstBuffer * buffer,
+                                                             guint width,
+                                                             guint height);
+GST_VA_API
 VASurfaceID           gst_va_buffer_get_aux_surface       (GstBuffer * buffer);
 GST_VA_API
 GstVaDisplay *        gst_va_buffer_peek_display          (GstBuffer * buffer);

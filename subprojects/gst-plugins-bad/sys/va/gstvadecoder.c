@@ -45,6 +45,9 @@ struct _GstVaDecoder
   guint rt_format;
   gint coded_width;
   gint coded_height;
+  /* request VAConfigAttribDecProcessing on the next open, for decode-time
+   * scaling on the fixed-function SFC */
+  gboolean processing;
 };
 
 GST_DEBUG_CATEGORY_STATIC (gst_va_decoder_debug);
@@ -217,13 +220,45 @@ gst_va_decoder_is_open (GstVaDecoder * self)
   return ret;
 }
 
+/* Whether the driver can scale and convert during decode (VD-SFC) for
+ * @profile. Queried without opening a config. */
+gboolean
+gst_va_decoder_has_processing (GstVaDecoder * self, VAProfile profile)
+{
+  VAConfigAttrib attrib = {.type = VAConfigAttribDecProcessing };
+  VADisplay dpy;
+  VAStatus status;
+
+  g_return_val_if_fail (GST_IS_VA_DECODER (self), FALSE);
+
+  dpy = gst_va_display_get_va_dpy (self->display);
+  status = vaGetConfigAttributes (dpy, profile, VAEntrypointVLD, &attrib, 1);
+  if (status != VA_STATUS_SUCCESS)
+    return FALSE;
+  if (attrib.value == VA_ATTRIB_NOT_SUPPORTED)
+    return FALSE;
+
+  return (attrib.value & VA_DEC_PROCESSING) != 0;
+}
+
+/* Request decode-time processing on the next gst_va_decoder_open(). */
+void
+gst_va_decoder_enable_processing (GstVaDecoder * self, gboolean enable)
+{
+  g_return_if_fail (GST_IS_VA_DECODER (self));
+  g_return_if_fail (!gst_va_decoder_is_open (self));
+
+  self->processing = enable;
+}
+
 gboolean
 gst_va_decoder_open (GstVaDecoder * self, VAProfile profile, guint rt_format)
 {
-  VAConfigAttrib attrib = {
-    .type = VAConfigAttribRTFormat,
-    .value = rt_format,
+  VAConfigAttrib attribs[2] = {
+    {.type = VAConfigAttribRTFormat,.value = rt_format},
+    {.type = VAConfigAttribDecProcessing,.value = VA_DEC_PROCESSING},
   };
+  guint num_attribs = 1;
   VAConfigID config;
   VADisplay dpy;
   VAStatus status;
@@ -239,8 +274,12 @@ gst_va_decoder_open (GstVaDecoder * self, VAProfile profile, guint rt_format)
     return FALSE;
   }
 
+  if (self->processing)
+    num_attribs = 2;
+
   dpy = gst_va_display_get_va_dpy (self->display);
-  status = vaCreateConfig (dpy, profile, VAEntrypointVLD, &attrib, 1, &config);
+  status = vaCreateConfig (dpy, profile, VAEntrypointVLD, attribs,
+      num_attribs, &config);
   if (status != VA_STATUS_SUCCESS) {
     GST_ERROR_OBJECT (self, "vaCreateConfig: %s", vaErrorStr (status));
     return FALSE;

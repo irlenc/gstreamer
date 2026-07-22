@@ -20,6 +20,8 @@
 
 #include "gstvabasedec.h"
 
+#include <va/va_vpp.h>
+
 #include <gst/va/gstva.h>
 #include <gst/va/gstvavideoformat.h>
 #include <gst/va/vasurfaceimage.h>
@@ -48,6 +50,30 @@ gst_va_base_dec_get_property (GObject * object, guint prop_id,
 
       break;
     }
+    case GST_VA_DEC_PROP_SFC_WIDTH:
+      g_value_set_uint (value, self->sfc_width);
+      break;
+    case GST_VA_DEC_PROP_SFC_HEIGHT:
+      g_value_set_uint (value, self->sfc_height);
+      break;
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+  }
+}
+
+static void
+gst_va_base_dec_set_property (GObject * object, guint prop_id,
+    const GValue * value, GParamSpec * pspec)
+{
+  GstVaBaseDec *self = GST_VA_BASE_DEC (object);
+
+  switch (prop_id) {
+    case GST_VA_DEC_PROP_SFC_WIDTH:
+      self->sfc_width = g_value_get_uint (value);
+      break;
+    case GST_VA_DEC_PROP_SFC_HEIGHT:
+      self->sfc_height = g_value_get_uint (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
   }
@@ -695,6 +721,44 @@ gst_va_base_dec_negotiate (GstVideoDecoder * decoder)
       GST_WARNING_OBJECT (decoder, "Failed to close decoder");
       return FALSE;
     }
+
+    /* Decode-time SFC scaling: negotiate the scaled size downstream and keep
+     * the DPB at coded size on per-buffer aux surfaces. The SFC crops the
+     * display region and scales in one fixed-function pass, so the output
+     * needs no alignment metadata. Interlaced content stays on the plain
+     * path: fields would each trigger the processing pass. */
+    base->apply_sfc = FALSE;
+    if (base->sfc_width > 0 && base->sfc_height > 0
+        && (gint) base->sfc_width <= GST_VIDEO_INFO_WIDTH (&base->output_info)
+        && (gint) base->sfc_height <=
+        GST_VIDEO_INFO_HEIGHT (&base->output_info)
+        && GST_VIDEO_INFO_INTERLACE_MODE (&base->output_info) ==
+        GST_VIDEO_INTERLACE_MODE_PROGRESSIVE
+        && gst_va_decoder_has_processing (base->decoder, base->profile)) {
+      base->apply_sfc = TRUE;
+
+      base->sfc_input_region = (VARectangle) {
+        .x = base->need_valign ? base->valign.padding_left : 0,
+        .y = base->need_valign ? base->valign.padding_top : 0,
+        .width = GST_VIDEO_INFO_WIDTH (&base->output_info),
+        .height = GST_VIDEO_INFO_HEIGHT (&base->output_info),
+      };
+      base->sfc_output_region = (VARectangle) {
+        .x = 0,
+        .y = 0,
+        .width = base->sfc_width,
+        .height = base->sfc_height,
+      };
+      base->need_valign = FALSE;
+      GST_VIDEO_INFO_WIDTH (&base->output_info) = base->sfc_width;
+      GST_VIDEO_INFO_HEIGHT (&base->output_info) = base->sfc_height;
+
+      GST_INFO_OBJECT (base, "decode-time SFC scale %dx%d -> %ux%u",
+          base->sfc_input_region.width, base->sfc_input_region.height,
+          base->sfc_width, base->sfc_height);
+    }
+    gst_va_decoder_enable_processing (base->decoder, base->apply_sfc);
+
     if (!gst_va_decoder_open (base->decoder, base->profile, base->rt_format)) {
       GST_WARNING_OBJECT (decoder, "Failed to open decoder");
       return FALSE;
@@ -757,6 +821,7 @@ gst_va_base_dec_class_init (GstVaBaseDecClass * klass, GstVaCodecs codec,
   }
 
   object_class->get_property = gst_va_base_dec_get_property;
+  object_class->set_property = gst_va_base_dec_set_property;
 
   element_class->set_context = GST_DEBUG_FUNCPTR (gst_va_base_dec_set_context);
 
@@ -774,6 +839,32 @@ gst_va_base_dec_class_init (GstVaBaseDecClass * klass, GstVaCodecs codec,
       g_param_spec_string ("device-path", "Device Path",
           GST_VA_DEVICE_PATH_PROP_DESC, NULL, GST_PARAM_DOC_SHOW_DEFAULT |
           G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstVaBaseDec:sfc-width:
+   *
+   * Decode-time downscale target width, 0 disables. When the driver
+   * supports decode processing (VD-SFC) for the negotiated profile and
+   * both dimensions request a downscale, the decoder outputs frames
+   * scaled on the fixed-function SFC and no separate postproc pass is
+   * needed. The caller owns aspect handling. Takes effect on the next
+   * sequence negotiation.
+   */
+  g_object_class_install_property (object_class, GST_VA_DEC_PROP_SFC_WIDTH,
+      g_param_spec_uint ("sfc-width", "SFC output width",
+          "Decode-time downscale target width (0 = disabled)",
+          0, 16384, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstVaBaseDec:sfc-height:
+   *
+   * Decode-time downscale target height, 0 disables. See
+   * #GstVaBaseDec:sfc-width.
+   */
+  g_object_class_install_property (object_class, GST_VA_DEC_PROP_SFC_HEIGHT,
+      g_param_spec_uint ("sfc-height", "SFC output height",
+          "Decode-time downscale target height (0 = disabled)",
+          0, 16384, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 }
 
 static inline GstVideoFormat
@@ -1140,6 +1231,46 @@ gst_va_base_dec_prepare_output_frame (GstVaBaseDec * base,
   if (frame)
     return gst_video_decoder_allocate_output_frame (vdec, frame);
   return GST_FLOW_OK;
+}
+
+/* When SFC decode scaling is active, attach a coded-size aux surface to the
+ * output buffer (the decode render target and DPB entry) and queue the
+ * per-frame processing parameter buffer whose additional output is the
+ * buffer's own scaled surface. Call it from the codec's new-picture path,
+ * after the output buffer exists and the decode picture was created. A
+ * no-op when SFC is inactive. */
+gboolean
+gst_va_base_dec_sfc_prepare (GstVaBaseDec * base, GstVaDecodePicture * pic,
+    GstBuffer * buffer)
+{
+  VAProcPipelineParameterBuffer proc;
+
+  if (!base->apply_sfc)
+    return TRUE;
+
+  if (!gst_va_buffer_create_aux_surface_full (buffer, base->width,
+          base->height)) {
+    GST_ERROR_OBJECT (base, "Couldn't create aux surface for SFC decode");
+    return FALSE;
+  }
+
+  base->sfc_surface = gst_va_buffer_get_surface (buffer);
+
+  /* vaCreateBuffer copies the struct; the region rectangles and the
+   * additional-outputs entry live in the instance because the driver
+   * dereferences those pointers at decode submission. */
+  /* *INDENT-OFF* */
+  proc = (VAProcPipelineParameterBuffer) {
+    .surface = gst_va_buffer_get_aux_surface (buffer),
+    .surface_region = &base->sfc_input_region,
+    .output_region = &base->sfc_output_region,
+    .additional_outputs = &base->sfc_surface,
+    .num_additional_outputs = 1,
+  };
+  /* *INDENT-ON* */
+
+  return gst_va_decoder_add_param_buffer (base->decoder, pic,
+      VAProcPipelineParameterBufferType, &proc, sizeof (proc));
 }
 
 gboolean

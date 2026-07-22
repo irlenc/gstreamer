@@ -109,7 +109,8 @@ gst_va_h264_dec_end_picture (GstH264Decoder * decoder, GstH264Picture * picture)
 
   va_pic = gst_h264_picture_get_user_data (picture);
 
-  if (!gst_va_decoder_decode (base->decoder, va_pic))
+  if (!gst_va_decoder_decode_with_aux_surface (base->decoder, va_pic,
+          base->apply_sfc))
     return GST_FLOW_ERROR;
 
   return GST_FLOW_OK;
@@ -159,7 +160,11 @@ _fill_vaapi_pic (VAPictureH264 * va_picture, GstH264Picture * picture,
     return;
   }
 
-  va_picture->picture_id = gst_va_decode_picture_get_surface (va_pic);
+  /* Under SFC decode scaling the aux surface is the decode render target
+   * and DPB entry; it only exists in that mode, so preferring it is safe. */
+  va_picture->picture_id = gst_va_decode_picture_get_aux_surface (va_pic);
+  if (va_picture->picture_id == VA_INVALID_ID)
+    va_picture->picture_id = gst_va_decode_picture_get_surface (va_pic);
   va_picture->flags = 0;
 
   if (picture->nonexisting)
@@ -495,6 +500,12 @@ gst_va_h264_dec_new_picture (GstH264Decoder * decoder,
     goto error;
 
   pic = gst_va_decode_picture_new (base->decoder, frame->output_buffer);
+
+  if (!gst_va_base_dec_sfc_prepare (base, pic, frame->output_buffer)) {
+    gst_va_decode_picture_free (pic);
+    ret = GST_FLOW_ERROR;
+    goto error;
+  }
 
   gst_h264_picture_set_user_data (picture, pic,
       (GDestroyNotify) gst_va_decode_picture_free);
