@@ -916,6 +916,78 @@ struct _GstVaCompositorSampleGenerator
   GstVaComposeSample sample;
 };
 
+/* The destination rectangle a pad blits to, mirroring the sample geometry in
+ * gst_va_compositor_sample_next(). Called with the pad's object lock held. */
+static void
+gst_va_compositor_pad_output_region (GstVideoAggregatorPad * vaggpad,
+    VARectangle * region)
+{
+  GstVaCompositorPad *pad = GST_VA_COMPOSITOR_PAD (vaggpad);
+
+  /* *INDENT-OFF* */
+  *region = (VARectangle) {
+    .x = pad->xpos,
+    .y = pad->ypos,
+    .width = (pad->width == DEFAULT_PAD_WIDTH)
+        ? GST_VIDEO_INFO_WIDTH (&vaggpad->info) : pad->width,
+    .height = (pad->height == DEFAULT_PAD_HEIGHT)
+        ? GST_VIDEO_INFO_HEIGHT (&vaggpad->info) : pad->height,
+  };
+  /* *INDENT-ON* */
+}
+
+static gboolean
+gst_va_compositor_region_contains (const VARectangle * outer,
+    const VARectangle * inner)
+{
+  return outer->x <= inner->x && outer->y <= inner->y
+      && outer->x + outer->width >= inner->x + inner->width
+      && outer->y + outer->height >= inner->y + inner->height;
+}
+
+/* Whether a pad drawn later (higher zorder) fully covers this pad's
+ * destination with opaque pixels, making its blit unobservable.
+ *
+ * Every sample costs a full VPP pass in gst_va_filter_compose() and possibly
+ * an import copy before it, so skipping an obscured pad saves real work; the
+ * software compositor has the same optimization in prepare_frame_start(). A
+ * covering pad only obscures when nothing of the pad below can show through:
+ * full global alpha and a format with no alpha channel. */
+static gboolean
+gst_va_compositor_pad_obscured (GstVideoAggregatorPad * vaggpad, GList * later)
+{
+  VARectangle region, above;
+  GList *l;
+
+  GST_OBJECT_LOCK (vaggpad);
+  gst_va_compositor_pad_output_region (vaggpad, &region);
+  GST_OBJECT_UNLOCK (vaggpad);
+
+  for (l = later; l; l = l->next) {
+    GstVideoAggregatorPad *vaggpad_above = GST_VIDEO_AGGREGATOR_PAD (l->data);
+    GstVaCompositorPad *pad_above = GST_VA_COMPOSITOR_PAD (l->data);
+    gboolean covers;
+
+    if (!gst_video_aggregator_pad_has_current_buffer (vaggpad_above))
+      continue;
+
+    GST_OBJECT_LOCK (vaggpad_above);
+    if (pad_above->alpha < 1.0
+        || GST_VIDEO_INFO_HAS_ALPHA (&vaggpad_above->info)) {
+      GST_OBJECT_UNLOCK (vaggpad_above);
+      continue;
+    }
+    gst_va_compositor_pad_output_region (vaggpad_above, &above);
+    GST_OBJECT_UNLOCK (vaggpad_above);
+
+    covers = gst_va_compositor_region_contains (&above, &region);
+    if (covers)
+      return TRUE;
+  }
+
+  return FALSE;
+}
+
 static GstVaComposeSample *
 gst_va_compositor_sample_next (gpointer data)
 {
@@ -945,6 +1017,10 @@ gst_va_compositor_sample_next (gpointer data)
     /* current sinkpad may not be queueing buffers yet (e.g. timestamp-offset)
      * or it may have reached EOS */
     if (!gst_video_aggregator_pad_has_current_buffer (vaggpad))
+      continue;
+
+    /* generator->current already points at the pads drawn on top of this one */
+    if (gst_va_compositor_pad_obscured (vaggpad, generator->current))
       continue;
 
     inbuf = gst_video_aggregator_pad_get_current_buffer (vaggpad);
