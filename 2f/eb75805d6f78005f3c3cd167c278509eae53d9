@@ -1,0 +1,19 @@
+subprojects/gst-plugins-bad/sys/va/gstvafilter.c
+  s_108af9614c9c73::t_514e6cd5e50a46 1893-1894,1901
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "2feb75805d6f78005f3c3cd167c278509eae53d9",
+  "prompts": {},
+  "sessions": {
+    "s_108af9614c9c73": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d8854bae-43ef-4746-94cd-76535f90602a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "datagutt <datagutt@lekanger.no>"
+    }
+  }
+}
