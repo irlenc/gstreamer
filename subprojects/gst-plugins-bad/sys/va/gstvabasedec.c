@@ -159,13 +159,6 @@ gst_va_base_dec_getcaps (GstVideoDecoder * decoder, GstCaps * filter)
     gst_object_unref (va_decoder);
   }
 
-  /* With decode-time SFC scaling requested, the coded size is decoupled
-   * from the downstream size, so the proxy must not transplant downstream
-   * size restrictions onto the sink: a 1080p stream into a decoder scaling
-   * to 720p is exactly the point. Answer with the template instead. */
-  if (!caps && base->sfc_width > 0 && base->sfc_height > 0)
-    caps = gst_pad_get_pad_template_caps (GST_VIDEO_DECODER_SINK_PAD (decoder));
-
   if (caps) {
     if (filter) {
       tmp = gst_caps_intersect_full (filter, caps, GST_CAPS_INTERSECT_FIRST);
@@ -174,10 +167,36 @@ gst_va_base_dec_getcaps (GstVideoDecoder * decoder, GstCaps * filter)
     }
     GST_LOG_OBJECT (base, "Returning caps %" GST_PTR_FORMAT, caps);
   } else {
-    caps = gst_video_decoder_proxy_getcaps (decoder, NULL, filter);
+    caps = gst_va_base_dec_proxy_getcaps (base, filter);
   }
 
   return caps;
+}
+
+/* Proxy fallback for getcaps, here and in the subclasses that override it.
+ * With decode-time SFC scaling requested the coded size is decoupled from
+ * the downstream size, so downstream size restrictions must not transplant
+ * onto the sink: a 1080p stream into a decoder scaling to 720p is exactly
+ * the point. Answer with the sink template instead. */
+GstCaps *
+gst_va_base_dec_proxy_getcaps (GstVaBaseDec * base, GstCaps * filter)
+{
+  GstVideoDecoder *decoder = GST_VIDEO_DECODER (base);
+
+  if (base->sfc_width > 0 && base->sfc_height > 0) {
+    GstCaps *caps, *tmp;
+
+    caps =
+        gst_pad_get_pad_template_caps (GST_VIDEO_DECODER_SINK_PAD (decoder));
+    if (filter) {
+      tmp = gst_caps_intersect_full (filter, caps, GST_CAPS_INTERSECT_FIRST);
+      gst_caps_unref (caps);
+      caps = tmp;
+    }
+    return caps;
+  }
+
+  return gst_video_decoder_proxy_getcaps (decoder, NULL, filter);
 }
 
 static gboolean

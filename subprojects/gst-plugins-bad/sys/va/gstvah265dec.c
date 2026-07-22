@@ -1198,7 +1198,7 @@ gst_va_h265_dec_getcaps (GstVideoDecoder * decoder, GstCaps * filter)
     }
     GST_LOG_OBJECT (base, "Returning caps %" GST_PTR_FORMAT, caps);
   } else if (!caps) {
-    caps = gst_video_decoder_proxy_getcaps (decoder, NULL, filter);
+    caps = gst_va_base_dec_proxy_getcaps (base, filter);
   }
 
   return caps;

@@ -164,6 +164,8 @@ gboolean              gst_va_base_dec_process_output      (GstVaBaseDec * base,
 GstFlowReturn         gst_va_base_dec_prepare_output_frame (GstVaBaseDec * base,
                                                             GstVideoCodecFrame * frame);
 gboolean              gst_va_base_dec_set_output_state    (GstVaBaseDec * base);
+GstCaps *             gst_va_base_dec_proxy_getcaps       (GstVaBaseDec * base,
+                                                           GstCaps * filter);
 gboolean              gst_va_base_dec_sfc_prepare         (GstVaBaseDec * base,
                                                            GstVaDecodePicture * pic,
                                                            GstBuffer * buffer);
