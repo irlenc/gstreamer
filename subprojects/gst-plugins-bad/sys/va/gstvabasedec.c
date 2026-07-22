@@ -728,10 +728,16 @@ gst_va_base_dec_negotiate (GstVideoDecoder * decoder)
      * needs no alignment metadata. Interlaced content stays on the plain
      * path: fields would each trigger the processing pass. */
     base->apply_sfc = FALSE;
+    /* Strict downscale only: an equal-size target would spend the SFC on a
+     * 1:1 pass, so a caller can set the target to its canvas unconditionally
+     * and same-size content decodes on the plain path. */
     if (base->sfc_width > 0 && base->sfc_height > 0
         && (gint) base->sfc_width <= GST_VIDEO_INFO_WIDTH (&base->output_info)
         && (gint) base->sfc_height <=
         GST_VIDEO_INFO_HEIGHT (&base->output_info)
+        && ((gint) base->sfc_width < GST_VIDEO_INFO_WIDTH (&base->output_info)
+            || (gint) base->sfc_height <
+            GST_VIDEO_INFO_HEIGHT (&base->output_info))
         && GST_VIDEO_INFO_INTERLACE_MODE (&base->output_info) ==
         GST_VIDEO_INTERLACE_MODE_PROGRESSIVE
         && gst_va_decoder_has_processing (base->decoder, base->profile)) {
