@@ -1,0 +1,19 @@
+subprojects/gst-plugins-bad/sys/va/gstvacompositor.c
+  s_d40794603f0ec1::t_12a245969b7874 978
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "d3354dfad5b3de0b1467c7420829507f2894acef",
+  "prompts": {},
+  "sessions": {
+    "s_d40794603f0ec1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d6e5fa40-053c-4a23-b20e-d945e039f17c",
+        "model": "claude-fable-5"
+      },
+      "human_author": "datagutt <datagutt@lekanger.no>"
+    }
+  }
+}
