@@ -214,13 +214,34 @@ gst_srt_object_resolve (GstSRTObject * srtobject, const gchar * address,
   saddr = g_inet_socket_address_new_from_string (address, port);
   if (!saddr) {
     GList *results;
+    GCancellable *resolve_cancellable;
+    gulong cancel_id = 0;
 
     GST_DEBUG_OBJECT (srtobject->element, "resolving IP address for host %s",
         address);
     resolver = g_resolver_get_default ();
+
+    /* Never hand srtobject->cancellable to GResolver: it is reset elsewhere
+     * (open_full, unlock_stop) while GThreadedResolver still holds a cancelled
+     * handler on it, and that handler asserts it is cancelled -- which aborts
+     * the process. Use a fresh cancellable that nothing resets, and chain the
+     * object's to it so cancellation still propagates.
+     * https://gitlab.freedesktop.org/gstreamer/gstreamer/-/issues/3946 */
+    resolve_cancellable = g_cancellable_new ();
+    if (srtobject->cancellable != NULL) {
+      cancel_id = g_cancellable_connect (srtobject->cancellable,
+          G_CALLBACK (g_cancellable_cancel), g_object_ref (resolve_cancellable),
+          g_object_unref);
+    }
+
     results =
-        g_resolver_lookup_by_name (resolver, address, srtobject->cancellable,
+        g_resolver_lookup_by_name (resolver, address, resolve_cancellable,
         &err);
+
+    if (cancel_id != 0)
+      g_cancellable_disconnect (srtobject->cancellable, cancel_id);
+    g_object_unref (resolve_cancellable);
+
     if (!results)
       goto name_resolve;
 
