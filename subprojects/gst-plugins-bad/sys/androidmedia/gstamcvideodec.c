@@ -414,7 +414,8 @@ gst_amc_video_dec_base_init (gpointer g_class)
   longname = g_strdup_printf ("Android MediaCodec %s", codec_info->name);
   gst_element_class_set_metadata (element_class,
       codec_info->name,
-      "Codec/Decoder/Video/Hardware",
+      gst_amc_codec_info_is_hardware (codec_info) ?
+      "Codec/Decoder/Video/Hardware" : "Codec/Decoder/Video",
       longname, "Sebastian Dröge <sebastian.droege@collabora.co.uk>");
   g_free (longname);
 }
@@ -2832,8 +2833,6 @@ gst_amc_video_dec_handle_frame (GstVideoDecoder * decoder,
     memset (&buffer_info, 0, sizeof (buffer_info));
     buffer_info.offset = 0;
     buffer_info.size = MIN (minfo.size - offset, buf->size);
-    gst_amc_buffer_set_position_and_limit (buf, NULL, buffer_info.offset,
-        buffer_info.size);
 
     orc_memcpy (buf->data, minfo.data + offset, buffer_info.size);
 
@@ -2998,7 +2997,6 @@ gst_amc_video_dec_drain (GstAmcVideoDec * self)
           gst_util_uint64_scale (self->last_upstream_ts, 1, GST_USECOND);
       buffer_info.flags |= BUFFER_FLAG_END_OF_STREAM;
 
-      gst_amc_buffer_set_position_and_limit (buf, NULL, 0, 0);
       gst_amc_buffer_free (buf);
       buf = NULL;
 

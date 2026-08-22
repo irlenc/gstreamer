@@ -437,6 +437,8 @@ _get_kind_from_media (const GstSDPMedia * media)
     kind = GST_WEBRTC_KIND_AUDIO;
   else if (!g_strcmp0 (gst_sdp_media_get_media (media), "video"))
     kind = GST_WEBRTC_KIND_VIDEO;
+  else if (!g_strcmp0 (gst_sdp_media_get_media (media), "application"))
+    kind = GST_WEBRTC_KIND_APPLICATION;
   return kind;
 }
 
@@ -901,6 +903,12 @@ _message_media_is_datachannel (const GstSDPMessage * msg, guint media_id)
 
   media = gst_sdp_message_get_media (msg, media_id);
 
+  return _media_is_datachannel (media);
+}
+
+gboolean
+_media_is_datachannel (const GstSDPMedia * media)
+{
   if (g_strcmp0 (gst_sdp_media_get_media (media), "application") != 0)
     return FALSE;
 

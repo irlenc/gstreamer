@@ -509,6 +509,155 @@ GST_END_TEST;
 #undef WIDTH
 #undef HEIGHT
 
+GST_START_TEST (test_video_formats_float)
+{
+  const GstVideoFormat float_formats[] = {
+    GST_VIDEO_FORMAT_RGBA_F16LE, GST_VIDEO_FORMAT_RGBA_F16BE,
+    GST_VIDEO_FORMAT_RGBA_F32LE, GST_VIDEO_FORMAT_RGBA_F32BE,
+  };
+  /* ARGB64 pixel whose components are exactly representable as half floats
+   * so the pack/unpack roundtrip is lossless for all float formats */
+  const guint16 argb64_in[] = { 0xffff, 0x4000, 0x8000, 0x2000 };
+  /* R, G, B, A rounded to the nearest IEEE 754 half float:
+   * 0.25, 0.5, 0.125, 1.0 */
+  const guint16 expected_half[] = { 0x3400, 0x3800, 0x3000, 0x3c00 };
+  guint i, c;
+
+  for (i = 0; i < G_N_ELEMENTS (float_formats); i++) {
+    const GstVideoFormatInfo *finfo;
+    GstVideoInfo vinfo;
+    guint16 argb64_out[4] = { 0, };
+    guint8 packed[16] = { 0, };
+    gpointer data[GST_VIDEO_MAX_PLANES] = { packed, };
+    gint stride[GST_VIDEO_MAX_PLANES] = { sizeof (packed), };
+    gboolean is_f16, is_le;
+
+    finfo = gst_video_format_get_info (float_formats[i]);
+    fail_unless (finfo != NULL);
+
+    GST_INFO ("testing %s", finfo->name);
+
+    is_f16 = float_formats[i] == GST_VIDEO_FORMAT_RGBA_F16LE
+        || float_formats[i] == GST_VIDEO_FORMAT_RGBA_F16BE;
+    is_le = float_formats[i] == GST_VIDEO_FORMAT_RGBA_F16LE
+        || float_formats[i] == GST_VIDEO_FORMAT_RGBA_F32LE;
+
+    fail_unless (GST_VIDEO_FORMAT_INFO_IS_FLOAT (finfo));
+    fail_unless (GST_VIDEO_FORMAT_INFO_IS_RGB (finfo));
+    fail_unless (GST_VIDEO_FORMAT_INFO_HAS_ALPHA (finfo));
+    fail_unless_equals_int (GST_VIDEO_FORMAT_INFO_IS_LE (finfo), is_le);
+    fail_unless_equals_int (GST_VIDEO_FORMAT_INFO_N_COMPONENTS (finfo), 4);
+    fail_unless_equals_int (GST_VIDEO_FORMAT_INFO_DEPTH (finfo, 0),
+        is_f16 ? 16 : 32);
+    fail_unless_equals_int (GST_VIDEO_FORMAT_INFO_PSTRIDE (finfo, 0),
+        is_f16 ? 8 : 16);
+    fail_unless_equals_int (finfo->unpack_format, GST_VIDEO_FORMAT_ARGB64);
+
+    fail_unless (gst_video_info_set_format (&vinfo, float_formats[i], 7, 5));
+    fail_unless_equals_int (GST_VIDEO_INFO_PLANE_STRIDE (&vinfo, 0),
+        7 * (is_f16 ? 8 : 16));
+    fail_unless_equals_int (GST_VIDEO_INFO_SIZE (&vinfo),
+        7 * 5 * (is_f16 ? 8 : 16));
+
+    finfo->pack_func (finfo, GST_VIDEO_PACK_FLAG_NONE, (gpointer) argb64_in,
+        sizeof (argb64_in), data, stride, GST_VIDEO_CHROMA_SITE_UNKNOWN, 0, 1);
+
+    /* verify component order and encoding in memory, 32-bit floats store
+     * the exact unnormalized value */
+    for (c = 0; c < 4; c++) {
+      gfloat expected_float = argb64_in[(c + 1) % 4] * (1.0f / 65535.0f);
+
+      if (is_f16 && is_le) {
+        fail_unless_equals_int_hex (GST_READ_UINT16_LE (packed + c * 2),
+            expected_half[c]);
+      } else if (is_f16) {
+        fail_unless_equals_int_hex (GST_READ_UINT16_BE (packed + c * 2),
+            expected_half[c]);
+      } else if (is_le) {
+        fail_unless_equals_float (GST_READ_FLOAT_LE (packed + c * 4),
+            expected_float);
+      } else {
+        fail_unless_equals_float (GST_READ_FLOAT_BE (packed + c * 4),
+            expected_float);
+      }
+    }
+
+    finfo->unpack_func (finfo, GST_VIDEO_PACK_FLAG_NONE, argb64_out, data,
+        stride, 0, 0, 1);
+
+    for (c = 0; c < 4; c++)
+      fail_unless_equals_int_hex (argb64_out[c], argb64_in[c]);
+
+    /* out of range values are clamped to [0, 1] when unpacking */
+    if (is_f16) {
+      /* -2.0, 2.0, 65504.0 (max half), 1.0 */
+      const guint16 oor[] = { 0xc000, 0x4000, 0x7bff, 0x3c00 };
+
+      for (c = 0; c < 4; c++) {
+        if (is_le)
+          GST_WRITE_UINT16_LE (packed + c * 2, oor[c]);
+        else
+          GST_WRITE_UINT16_BE (packed + c * 2, oor[c]);
+      }
+    } else {
+      const gfloat oor[] = { -2.0f, 2.0f, 65504.0f, 1.0f };
+
+      for (c = 0; c < 4; c++) {
+        if (is_le)
+          GST_WRITE_FLOAT_LE (packed + c * 4, oor[c]);
+        else
+          GST_WRITE_FLOAT_BE (packed + c * 4, oor[c]);
+      }
+    }
+
+    finfo->unpack_func (finfo, GST_VIDEO_PACK_FLAG_NONE, argb64_out, data,
+        stride, 0, 0, 1);
+
+    /* ARGB64 order: A, R, G, B <- R=-2.0, G=2.0, B=65504.0, A=1.0 */
+    fail_unless_equals_int_hex (argb64_out[0], 0xffff);
+    fail_unless_equals_int_hex (argb64_out[1], 0x0000);
+    fail_unless_equals_int_hex (argb64_out[2], 0xffff);
+    fail_unless_equals_int_hex (argb64_out[3], 0xffff);
+
+    /* every NaN maps to 0 and infinities saturate, on all unpack code
+     * paths; written as bit patterns so no intermediate FPU operation can
+     * quiet the signaling NaN */
+    if (is_f16) {
+      /* +NaN, signaling +NaN, -NaN, +inf */
+      const guint16 special[] = { 0x7e00, 0x7c01, 0xfe00, 0x7c00 };
+
+      for (c = 0; c < 4; c++) {
+        if (is_le)
+          GST_WRITE_UINT16_LE (packed + c * 2, special[c]);
+        else
+          GST_WRITE_UINT16_BE (packed + c * 2, special[c]);
+      }
+    } else {
+      /* +NaN, signaling +NaN, -NaN, +inf */
+      const guint32 special[] =
+          { 0x7fc00000, 0x7f800001, 0xffc00000, 0x7f800000 };
+
+      for (c = 0; c < 4; c++) {
+        if (is_le)
+          GST_WRITE_UINT32_LE (packed + c * 4, special[c]);
+        else
+          GST_WRITE_UINT32_BE (packed + c * 4, special[c]);
+      }
+    }
+
+    finfo->unpack_func (finfo, GST_VIDEO_PACK_FLAG_NONE, argb64_out, data,
+        stride, 0, 0, 1);
+
+    /* ARGB64 order: A, R, G, B <- R=+NaN, G=sNaN, B=-NaN, A=+inf */
+    fail_unless_equals_int_hex (argb64_out[0], 0xffff);
+    fail_unless_equals_int_hex (argb64_out[1], 0x0000);
+    fail_unless_equals_int_hex (argb64_out[2], 0x0000);
+    fail_unless_equals_int_hex (argb64_out[3], 0x0000);
+  }
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_video_formats)
 {
   guint i;
@@ -991,6 +1140,8 @@ GST_START_TEST (test_parse_colorimetry)
         _16_235, BT2020, BT2020_12, BT2020),
     MAKE_COLORIMETRY_TEST ("1:4:0:0", "1:4:0:0", NULL,
         _0_255, BT601, UNKNOWN, UNKNOWN),
+    MAKE_COLORIMETRY_TEST ("3:1:7:1", "3:1:7:1", NULL,
+        _0_1, RGB, SRGB, BT709),
   };
   gint i;
 
@@ -1018,6 +1169,60 @@ GST_START_TEST (test_parse_colorimetry)
 
 GST_END_TEST;
 
+GST_START_TEST (test_float_default_colorimetry)
+{
+  GstVideoFormat float_formats[] = {
+    GST_VIDEO_FORMAT_RGBA_F16LE, GST_VIDEO_FORMAT_RGBA_F16BE,
+    GST_VIDEO_FORMAT_RGBA_F32LE, GST_VIDEO_FORMAT_RGBA_F32BE,
+  };
+  GstVideoInfo info;
+  GstCaps *caps;
+  gint i;
+
+  for (i = 0; i < G_N_ELEMENTS (float_formats); i++) {
+    fail_unless (gst_video_info_set_format (&info, float_formats[i], 320, 240));
+    fail_unless_equals_int (info.colorimetry.range, GST_VIDEO_COLOR_RANGE_0_1);
+    fail_unless_equals_int (info.colorimetry.matrix,
+        GST_VIDEO_COLOR_MATRIX_RGB);
+    fail_unless_equals_int (info.colorimetry.transfer, GST_VIDEO_TRANSFER_SRGB);
+    fail_unless_equals_int (info.colorimetry.primaries,
+        GST_VIDEO_COLOR_PRIMARIES_BT709);
+
+    caps = gst_video_info_to_caps (&info);
+    fail_unless (caps != NULL);
+    fail_unless (gst_video_info_from_caps (&info, caps));
+    fail_unless_equals_int (info.colorimetry.range, GST_VIDEO_COLOR_RANGE_0_1);
+    gst_caps_unref (caps);
+  }
+
+  /* integer RGB formats keep the full-range default */
+  fail_unless (gst_video_info_set_format (&info, GST_VIDEO_FORMAT_RGBA, 320,
+          240));
+  fail_unless_equals_int (info.colorimetry.range, GST_VIDEO_COLOR_RANGE_0_255);
+
+  /* reserved ranges on float formats are coerced to 0_1, the other
+   * colorimetry fields are preserved */
+  caps = gst_caps_from_string ("video/x-raw, format=RGBA_F16LE, width=320, "
+      "height=240, framerate=30/1, colorimetry=bt709");
+  fail_unless (gst_video_info_from_caps (&info, caps));
+  fail_unless_equals_int (info.colorimetry.range, GST_VIDEO_COLOR_RANGE_0_1);
+  fail_unless_equals_int (info.colorimetry.matrix, GST_VIDEO_COLOR_MATRIX_RGB);
+  fail_unless_equals_int (info.colorimetry.transfer, GST_VIDEO_TRANSFER_BT709);
+  fail_unless_equals_int (info.colorimetry.primaries,
+      GST_VIDEO_COLOR_PRIMARIES_BT709);
+  gst_caps_unref (caps);
+
+  /* and the 0_1 range on integer formats is coerced to 0_255 */
+  caps = gst_caps_from_string ("video/x-raw, format=RGBA, width=320, "
+      "height=240, framerate=30/1, colorimetry=3:1:7:1");
+  fail_unless (gst_video_info_from_caps (&info, caps));
+  fail_unless_equals_int (info.colorimetry.range, GST_VIDEO_COLOR_RANGE_0_255);
+  fail_unless_equals_int (info.colorimetry.transfer, GST_VIDEO_TRANSFER_SRGB);
+  gst_caps_unref (caps);
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_events)
 {
   GstEvent *e;
@@ -1040,6 +1245,84 @@ GST_START_TEST (test_events)
       "Failed to parse still frame event w/ in_still == NULL");
   fail_unless (in_still == FALSE);
   gst_event_unref (e);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_video_convert_rgba_float_lossless)
+{
+  /* HDR (> 1.0) and out-of-gamut (< 0.0) values, exact in both float and half
+   * float, so the roundtrip must be bit-exact (the generic ARGB64 path clamps
+   * to [0, 1]). */
+  const gfloat pixel[4] = { 4.0f, 0.5f, -0.25f, 1.0f };
+  const struct
+  {
+    GstVideoFormat f32, f16;
+    gboolean le;
+  } cases[] = {
+    {GST_VIDEO_FORMAT_RGBA_F32LE, GST_VIDEO_FORMAT_RGBA_F16LE, TRUE},
+    {GST_VIDEO_FORMAT_RGBA_F32BE, GST_VIDEO_FORMAT_RGBA_F16BE, FALSE},
+  };
+  guint i, c;
+
+  for (i = 0; i < G_N_ELEMENTS (cases); i++) {
+    GstVideoInfo f32info, f16info;
+    GstVideoFrame frame, frame2;
+    GstBuffer *f32buf, *f16buf, *backbuf;
+    GstVideoConverter *convert;
+    guint8 *d;
+
+    fail_unless (gst_video_info_set_format (&f32info, cases[i].f32, 1, 1));
+    fail_unless (gst_video_info_set_format (&f16info, cases[i].f16, 1, 1));
+
+    /* one-pixel RGBA_F32 source */
+    f32buf = gst_buffer_new_and_alloc (f32info.size);
+    fail_unless (gst_video_frame_map (&frame, &f32info, f32buf, GST_MAP_WRITE));
+    d = GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
+    for (c = 0; c < 4; c++) {
+      if (cases[i].le)
+        GST_WRITE_FLOAT_LE (d + c * 4, pixel[c]);
+      else
+        GST_WRITE_FLOAT_BE (d + c * 4, pixel[c]);
+    }
+    gst_video_frame_unmap (&frame);
+
+    /* RGBA_F32 -> RGBA_F16 */
+    f16buf = gst_buffer_new_and_alloc (f16info.size);
+    fail_unless (gst_video_frame_map (&frame, &f32info, f32buf, GST_MAP_READ));
+    fail_unless (gst_video_frame_map (&frame2, &f16info, f16buf,
+            GST_MAP_WRITE));
+    convert = gst_video_converter_new (&f32info, &f16info, NULL);
+    gst_video_converter_frame (convert, &frame, &frame2);
+    gst_video_converter_free (convert);
+    gst_video_frame_unmap (&frame2);
+    gst_video_frame_unmap (&frame);
+
+    /* RGBA_F16 -> RGBA_F32 */
+    backbuf = gst_buffer_new_and_alloc (f32info.size);
+    fail_unless (gst_video_frame_map (&frame, &f16info, f16buf, GST_MAP_READ));
+    fail_unless (gst_video_frame_map (&frame2, &f32info, backbuf,
+            GST_MAP_WRITE));
+    convert = gst_video_converter_new (&f16info, &f32info, NULL);
+    gst_video_converter_frame (convert, &frame, &frame2);
+    gst_video_converter_free (convert);
+    gst_video_frame_unmap (&frame2);
+    gst_video_frame_unmap (&frame);
+
+    /* the roundtrip preserves every component exactly */
+    fail_unless (gst_video_frame_map (&frame, &f32info, backbuf, GST_MAP_READ));
+    d = GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
+    for (c = 0; c < 4; c++) {
+      gfloat v = cases[i].le ? GST_READ_FLOAT_LE (d + c * 4)
+          : GST_READ_FLOAT_BE (d + c * 4);
+      fail_unless_equals_float (v, pixel[c]);
+    }
+    gst_video_frame_unmap (&frame);
+
+    gst_buffer_unref (f32buf);
+    gst_buffer_unref (f16buf);
+    gst_buffer_unref (backbuf);
+  }
 }
 
 GST_END_TEST;
@@ -2119,7 +2402,7 @@ make_pixels (gint depth, gint width, gint height)
 #define OUT(i,j,o) (out[((i)*width + (j))*4+o] & mask[o])
 static gint
 compare_frame (const GstVideoFormatInfo * finfo, gint depth, guint8 * outpixels,
-    guint8 * pixels, gint width, gint height)
+    guint8 * pixels, gint width, gint height, gint tolerance)
 {
   gint diff, i, j, k;
   guint ws[4], hs[4], mask[4];
@@ -2127,7 +2410,7 @@ compare_frame (const GstVideoFormatInfo * finfo, gint depth, guint8 * outpixels,
   for (k = 0; k < 4; k++) {
     hs[k] = G_MAXUINT << finfo->h_sub[(3 + k) % 4];
     ws[k] = G_MAXUINT << finfo->w_sub[(3 + k) % 4];
-    mask[k] = G_MAXUINT << (depth - finfo->depth[(3 + k) % 4]);
+    mask[k] = G_MAXUINT << MAX (depth - finfo->depth[(3 + k) % 4], 0);
   }
   diff = 0;
   if (depth == 8) {
@@ -2137,7 +2420,7 @@ compare_frame (const GstVideoFormatInfo * finfo, gint depth, guint8 * outpixels,
     for (i = 0; i < height; i++) {
       for (j = 0; j < width; j++) {
         for (k = 0; k < 4; k++) {
-          diff += IN (i, j, k) != OUT (i, j, k);
+          diff += ABS ((gint) IN (i, j, k) - (gint) OUT (i, j, k)) > tolerance;
         }
       }
     }
@@ -2148,7 +2431,7 @@ compare_frame (const GstVideoFormatInfo * finfo, gint depth, guint8 * outpixels,
     for (i = 0; i < height; i++) {
       for (j = 0; j < width; j++) {
         for (k = 0; k < 4; k++) {
-          diff += IN (i, j, k) != OUT (i, j, k);
+          diff += ABS ((gint) IN (i, j, k) - (gint) OUT (i, j, k)) > tolerance;
         }
       }
     }
@@ -2218,7 +2501,7 @@ GST_START_TEST (test_video_pack_unpack2)
     const GstVideoFormatInfo *finfo, *fuinfo;
     GstBuffer *buffer;
     GstVideoFrame frame;
-    gint k, stride, count, diff, depth;
+    gint k, stride, count, diff, depth, tolerance;
     guint8 *pixels, *outpixels;
     gdouble elapsed;
     gdouble unpack_sec, pack_sec;
@@ -2293,8 +2576,16 @@ GST_START_TEST (test_video_pack_unpack2)
     res.convert_sec = pack_sec;
     g_array_append_val (packarray, res);
 
-    /* compare the frame */
-    diff = compare_frame (finfo, depth, outpixels, pixels, WIDTH, HEIGHT);
+    /* compare the frame, half floats only keep 11 bits of mantissa so a
+     * 16-bit value roundtrips with an error of up to 16 */
+    if (GST_VIDEO_FORMAT_INFO_IS_FLOAT (finfo)
+        && GST_VIDEO_FORMAT_INFO_DEPTH (finfo, 0) == 16)
+      tolerance = 16;
+    else
+      tolerance = 0;
+    diff =
+        compare_frame (finfo, depth, outpixels, pixels, WIDTH, HEIGHT,
+        tolerance);
 
     GST_DEBUG ("%f \t %f \t %f \t %f \t %s %d/%f", pack_sec, unpack_sec,
         info.size * pack_sec, info.size * unpack_sec, finfo->name, count,
@@ -4908,11 +5199,14 @@ video_suite (void)
   tcase_add_test (tc_chain, test_video_formats_rgba_large_dimension);
   tcase_add_test (tc_chain, test_video_formats_all);
   tcase_add_test (tc_chain, test_video_formats_pack_unpack);
+  tcase_add_test (tc_chain, test_video_formats_float);
+  tcase_add_test (tc_chain, test_video_convert_rgba_float_lossless);
   tcase_add_test (tc_chain, test_guess_framerate);
   tcase_add_test (tc_chain, test_dar_calc);
   tcase_add_test (tc_chain, test_parse_caps_rgb);
   tcase_add_test (tc_chain, test_parse_caps_multiview);
   tcase_add_test (tc_chain, test_parse_colorimetry);
+  tcase_add_test (tc_chain, test_float_default_colorimetry);
   tcase_add_test (tc_chain, test_events);
   tcase_add_test (tc_chain, test_convert_frame);
   tcase_add_test (tc_chain, test_convert_frame_async);

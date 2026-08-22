@@ -2168,6 +2168,10 @@ _find_codec_preferences (GstWebRTCBin * webrtc,
         gst_caps_set_simple (filter, "media", G_TYPE_STRING, "audio", NULL);
       else if (rtp_trans->kind == GST_WEBRTC_KIND_VIDEO)
         gst_caps_set_simple (filter, "media", G_TYPE_STRING, "video", NULL);
+      else if (rtp_trans->kind == GST_WEBRTC_KIND_APPLICATION) {
+        gst_caps_set_simple (filter, "media", G_TYPE_STRING, "application",
+            NULL);
+      }
 
       caps = _query_pad_caps (webrtc, rtp_trans, pad, filter, error);
     }
@@ -2490,6 +2494,7 @@ _nicesink_pad_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
                 case GST_WEBRTC_KIND_VIDEO:
                   dscp = 38;    /* AF43 *//* TODO: differentiate non-interactive */
                   break;
+                case GST_WEBRTC_KIND_APPLICATION:
                 case GST_WEBRTC_KIND_UNKNOWN:
                   dscp = 0;
                   break;
@@ -2503,6 +2508,7 @@ _nicesink_pad_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
                 case GST_WEBRTC_KIND_VIDEO:
                   dscp = 36;    /* AF42 *//* TODO: differentiate non-interactive */
                   break;
+                case GST_WEBRTC_KIND_APPLICATION:
                 case GST_WEBRTC_KIND_UNKNOWN:
                   dscp = 0;
                   break;
@@ -4679,7 +4685,7 @@ _create_answer_task (GstWebRTCBin * webrtc, const GstStructure * options,
     }
     _media_replace_setup (media, answer_setup);
 
-    if (g_strcmp0 (gst_sdp_media_get_media (offer_media), "application") == 0) {
+    if (_media_is_datachannel (offer_media)) {
       int sctp_port;
 
       if (gst_sdp_media_formats_len (offer_media) != 1) {
@@ -4714,8 +4720,7 @@ _create_answer_task (GstWebRTCBin * webrtc, const GstStructure * options,
 
       _add_fingerprint_to_media (webrtc->priv->sctp_transport->transport,
           media);
-    } else if (g_strcmp0 (gst_sdp_media_get_media (offer_media), "audio") == 0
-        || g_strcmp0 (gst_sdp_media_get_media (offer_media), "video") == 0) {
+    } else if (_get_kind_from_media (offer_media) != GST_WEBRTC_KIND_UNKNOWN) {
       GstCaps *offer_caps, *answer_caps = NULL;
       GstWebRTCRTPTransceiver *rtp_trans = NULL;
       WebRTCTransceiver *trans = NULL;
@@ -5881,6 +5886,7 @@ _update_transceiver_from_sdp_media (GstWebRTCBin * webrtc,
   GstWebRTCRTPTransceiverDirection new_dir;
   const GstSDPMedia *local_media, *remote_media;
   const GstSDPMedia *media = gst_sdp_message_get_media (sdp, media_idx);
+  const GstWebRTCKind kind = _get_kind_from_media (media);
   GstWebRTCDTLSSetup new_setup;
   char *local_msid = NULL;
   gboolean new_rtcp_rsize;
@@ -5896,18 +5902,14 @@ _update_transceiver_from_sdp_media (GstWebRTCBin * webrtc,
 
   rtp_trans->mline = media_idx;
 
-  if (!g_strcmp0 (gst_sdp_media_get_media (media), "audio")) {
-    if (rtp_trans->kind == GST_WEBRTC_KIND_VIDEO)
-      GST_FIXME_OBJECT (webrtc, "Updating video transceiver %" GST_PTR_FORMAT
-          " to audio, which isn't fully supported.", rtp_trans);
-    rtp_trans->kind = GST_WEBRTC_KIND_AUDIO;
-  }
-
-  if (!g_strcmp0 (gst_sdp_media_get_media (media), "video")) {
-    if (rtp_trans->kind == GST_WEBRTC_KIND_AUDIO)
-      GST_FIXME_OBJECT (webrtc, "Updating audio transceiver %" GST_PTR_FORMAT
-          " to video, which isn't fully supported.", rtp_trans);
-    rtp_trans->kind = GST_WEBRTC_KIND_VIDEO;
+  if (rtp_trans->kind != kind) {
+    if (rtp_trans->kind != GST_WEBRTC_KIND_UNKNOWN) {
+      GST_FIXME_OBJECT (webrtc, "Updating %s transceiver %" GST_PTR_FORMAT
+          " to %s, which isn't fully supported.",
+          gst_webrtc_kind_to_string (rtp_trans->kind), rtp_trans,
+          gst_webrtc_kind_to_string (kind));
+    }
+    rtp_trans->kind = kind;
   }
 
   for (i = 0; i < gst_sdp_media_attributes_len (media); i++) {
@@ -6379,8 +6381,11 @@ _update_transceivers_from_sdp (GstWebRTCBin * webrtc, SDPSource source,
       ensure_rtx_hdr_ext (stream);
     }
 
-    if (g_strcmp0 (gst_sdp_media_get_media (media), "audio") == 0 ||
-        g_strcmp0 (gst_sdp_media_get_media (media), "video") == 0) {
+    if (_media_is_datachannel (media)) {
+      _update_data_channel_from_sdp_media (webrtc, sdp->sdp, i, stream, error);
+      if (error && *error)
+        goto done;
+    } else if (_get_kind_from_media (media) != GST_WEBRTC_KIND_UNKNOWN) {
       GstWebRTCRTPTransceiver *trans;
 
       trans = _find_transceiver_for_sdp_media (webrtc, sdp->sdp, i);
@@ -6393,10 +6398,6 @@ _update_transceivers_from_sdp (GstWebRTCBin * webrtc, SDPSource source,
 
       _update_transceiver_from_sdp_media (webrtc, sdp->sdp, i, stream,
           trans, bundled, bundle_idx, error);
-      if (error && *error)
-        goto done;
-    } else if (_message_media_is_datachannel (sdp->sdp, i)) {
-      _update_data_channel_from_sdp_media (webrtc, sdp->sdp, i, stream, error);
       if (error && *error)
         goto done;
     } else {
@@ -6464,19 +6465,7 @@ check_locked_mlines (GstWebRTCBin * webrtc, GstWebRTCSessionDescription * sdp,
     }
 
     if (rtp_trans->kind != GST_WEBRTC_KIND_UNKNOWN) {
-      if (!g_strcmp0 (gst_sdp_media_get_media (media), "audio") &&
-          rtp_trans->kind != GST_WEBRTC_KIND_AUDIO) {
-        g_set_error (error, GST_WEBRTC_ERROR,
-            GST_WEBRTC_ERROR_INTERNAL_FAILURE,
-            "m-line %d with transceiver <%s> was locked to %s, but SDP has "
-            "%s media", i, GST_OBJECT_NAME (rtp_trans),
-            gst_webrtc_kind_to_string (rtp_trans->kind),
-            gst_sdp_media_get_media (media));
-        return FALSE;
-      }
-
-      if (!g_strcmp0 (gst_sdp_media_get_media (media), "video") &&
-          rtp_trans->kind != GST_WEBRTC_KIND_VIDEO) {
+      if (rtp_trans->kind != _get_kind_from_media (media)) {
         g_set_error (error, GST_WEBRTC_ERROR,
             GST_WEBRTC_ERROR_INTERNAL_FAILURE,
             "m-line %d with transceiver <%s> was locked to %s, but SDP has "

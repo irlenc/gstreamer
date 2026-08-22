@@ -119,3 +119,36 @@ meson setup <builddir>
 When onnxruntime is detected in `/usr/local`, meson automatically sets `PKG_CONFIG_PATH`,
 `LD_LIBRARY_PATH`, and `HIP_VISIBLE_DEVICES=0` in the devenv. No manual action is required
 when building with meson devenv.
+
+6. HIP (AMD GPU, dynamically loaded EP)
+
+The HIP EP is not built into onnxruntime. It is shipped as a separate
+execution provider library and loaded dynamically at runtime, which
+requires onnxruntime >= 1.22.
+
+6.1 Install the HIP EP, then point `MORPHIZEN_EP_LIB` at the EP library
+before running the pipeline:
+
+```
+export MORPHIZEN_EP_LIB=/opt/hip-ep/lib/libhipgpu.so
+```
+
+6.2 On a multi-GPU system, select the GPU with the `device` property
+(card index, e.g. `device=1`). Without it, all detected HIP GPUs are
+passed to the EP.
+
+7. Windows ML
+
+On Windows, the plugin can be built against the Microsoft-provided ONNX Runtime
+using the onnx-winml option:
+```
+meson setup <builddir> -Dgst-plugins-bad:onnx-winml=enabled
+```
+
+Windows has its own `onnxruntime.dll` in `System32`, which is searched before
+`PATH` for unpackaged applications. Because of this, adding the Windows ML
+runtime directory to `PATH`, including via meson devenv, is not enough.
+
+For testing, copy the Windows ML `onnxruntime.dll` next to the executable being
+used, such as gst-launch-1.0.exe. Applications using the ONNX plugin need to
+deploy the Windows ML `onnxruntime.dll` next to their executable as well.

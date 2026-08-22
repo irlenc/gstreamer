@@ -673,23 +673,25 @@ again:
   if (!gst_vulkan_operation_add_dependency_frame (priv->exec, pic->out,
           VK_PIPELINE_STAGE_2_VIDEO_DECODE_BIT_KHR,
           VK_PIPELINE_STAGE_2_VIDEO_DECODE_BIT_KHR)) {
-    return FALSE;
+    goto reset_and_error;
   }
 
   new_layout = ((self->layered_dpb && self->dedicated_dpb) || pic->dpb) ?
       VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR :
       VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR;
-  gst_vulkan_operation_add_frame_barrier (priv->exec, pic->out,
-      VK_PIPELINE_STAGE_2_VIDEO_DECODE_BIT_KHR,
-      VK_PIPELINE_STAGE_2_VIDEO_DECODE_BIT_KHR,
-      VK_ACCESS_2_VIDEO_DECODE_WRITE_BIT_KHR, new_layout, NULL);
+  if (!gst_vulkan_operation_add_frame_barrier (priv->exec, pic->out,
+          VK_PIPELINE_STAGE_2_VIDEO_DECODE_BIT_KHR,
+          VK_PIPELINE_STAGE_2_VIDEO_DECODE_BIT_KHR,
+          VK_ACCESS_2_VIDEO_DECODE_WRITE_BIT_KHR, new_layout, NULL)) {
+    goto reset_and_error;
+  }
 
   /* Reference for the current image, if existing and not layered */
   if (pic->dpb) {
     if (!gst_vulkan_operation_add_dependency_frame (priv->exec, pic->dpb,
             VK_PIPELINE_STAGE_2_VIDEO_DECODE_BIT_KHR,
             VK_PIPELINE_STAGE_2_VIDEO_DECODE_BIT_KHR)) {
-      return FALSE;
+      goto reset_and_error;
     }
   }
 
@@ -703,7 +705,7 @@ again:
       if (!gst_vulkan_operation_add_dependency_frame (priv->exec, ref_buf,
               VK_PIPELINE_STAGE_2_VIDEO_DECODE_BIT_KHR,
               VK_PIPELINE_STAGE_2_VIDEO_DECODE_BIT_KHR)) {
-        return FALSE;
+        goto reset_and_error;
       }
 
       if (!ref_pic->dpb) {
@@ -745,7 +747,7 @@ again:
     if (!gst_vulkan_operation_add_dependency_frame (priv->exec,
             self->layered_buffer, VK_PIPELINE_STAGE_2_VIDEO_DECODE_BIT_KHR,
             VK_PIPELINE_STAGE_2_VIDEO_DECODE_BIT_KHR)) {
-      return FALSE;
+      goto reset_and_error;
     }
   }
 
@@ -775,6 +777,13 @@ again:
   }
 
   return ret;
+
+reset_and_error:
+  {
+    GST_WARNING_OBJECT (self, "Failed barrier operation");
+    gst_vulkan_operation_reset (priv->exec);
+    return FALSE;
+  }
 }
 
 /**
@@ -990,8 +999,6 @@ gst_vulkan_decoder_update_ycbcr_sampler (GstVulkanDecoder * self,
   GstVulkanDecoderPrivate *priv;
   GstVulkanHandle *handle;
   VkSamplerYcbcrConversionCreateInfo create_info;
-  VkSamplerYcbcrConversion ycbr_conversion;
-  VkResult res;
 
   g_return_val_if_fail (GST_IS_VULKAN_DECODER (self), FALSE);
 
@@ -1018,16 +1025,10 @@ gst_vulkan_decoder_update_ycbcr_sampler (GstVulkanDecoder * self,
   };
   /* *INDENT-ON* */
 
-  res = vkCreateSamplerYcbcrConversion (device->device, &create_info, NULL,
-      &ycbr_conversion);
-  if (gst_vulkan_error_to_g_error (res, error,
-          "vkCreateSamplerYcbcrConversion") != VK_SUCCESS)
+  handle = gst_vulkan_handle_create_sampler_ycbcr_conversion (device,
+      &create_info, error);
+  if (!handle)
     return FALSE;
-
-  handle = gst_vulkan_handle_new_wrapped (device,
-      GST_VULKAN_HANDLE_TYPE_SAMPLER_YCBCR_CONVERSION,
-      (GstVulkanHandleTypedef) ycbr_conversion,
-      gst_vulkan_handle_free_sampler_ycbcr_conversion, NULL);
 
   gst_clear_vulkan_handle (&priv->sampler);
   priv->sampler = handle;

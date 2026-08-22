@@ -104,16 +104,26 @@
 #include "config.h"
 #endif
 
+#include "gstonnx-config.h"
 #include "gstonnxinference.h"
 
 #include <gst/gst.h>
 #include <string.h>
+#include <math.h>
 #include <gst/analytics/analytics.h>
 
 #include <onnxruntime_c_api.h>
 
-#ifdef HAVE_VSI_NPU
+#if HAVE_VSI_NPU
 #include <core/providers/vsinpu/vsinpu_provider_factory.h>
+#endif
+
+#if HAVE_WINML
+#include "gstonnx-winml.h"
+#endif
+
+#if HAVE_DIRECTML
+#include "gstonnx-dml.h"
 #endif
 
 typedef enum
@@ -130,6 +140,8 @@ typedef enum
   GST_ONNX_EXECUTION_PROVIDER_CUDA,
   GST_ONNX_EXECUTION_PROVIDER_VSI,
   GST_ONNX_EXECUTION_PROVIDER_MIGRAPHX,
+  GST_ONNX_EXECUTION_PROVIDER_HIP,
+  GST_ONNX_EXECUTION_PROVIDER_DIRECTML,
 } GstOnnxExecutionProvider;
 
 struct _GstOnnxInference
@@ -165,6 +177,14 @@ struct _GstOnnxInference
   bool fixedInputImageSize;
   double *scales;
   double *offsets;
+  gchar *input_name;
+  size_t input_dims_count;
+  int64_t *input_dims_model;
+  int64_t *input_dims_runtime;
+  const gchar *registered_ep_name;
+#if HAVE_DIRECTML
+  GstOnnxDmlCtx *dml_ctx;
+#endif
 };
 
 static const OrtApi *api = NULL;
@@ -194,14 +214,14 @@ static GstStaticPadTemplate gst_onnx_inference_src_template =
 GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE ("{ RGB,RGBA,BGR,BGRA }"))
+    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE ("{ RGB, RGBP, GRAY8 }"))
     );
 
 static GstStaticPadTemplate gst_onnx_inference_sink_template =
 GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE ("{ RGB,RGBA,BGR,BGRA }"))
+    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE ("{ RGB, RGBP, GRAY8 }"))
     );
 
 
@@ -217,6 +237,9 @@ static GstCaps *gst_onnx_inference_transform_caps (GstBaseTransform *
 static gboolean
 gst_onnx_inference_set_caps (GstBaseTransform * trans, GstCaps * incaps,
     GstCaps * outcaps);
+static gboolean
+gst_onnx_inference_propose_allocation (GstBaseTransform * trans,
+    GstQuery * decide_query, GstQuery * query);
 static gboolean gst_onnx_inference_start (GstBaseTransform * trans);
 static gboolean gst_onnx_inference_stop (GstBaseTransform * trans);
 
@@ -275,7 +298,7 @@ gst_onnx_execution_provider_get_type (void)
             "CUDA execution provider (compiled out, will use CPU)",
           "cuda"},
 #endif
-#ifdef HAVE_VSI_NPU
+#if HAVE_VSI_NPU
       /**
        * GstOnnxExecutionProvider::vsi
        *
@@ -293,7 +316,7 @@ gst_onnx_execution_provider_get_type (void)
           "vsi"},
 #endif
 
-#ifdef HAVE_MIGRAPHX
+#if HAVE_MIGRAPHX || HAVE_WINML
       /**
        * GstOnnxExecutionProvider::migraphx
        *
@@ -309,6 +332,39 @@ gst_onnx_execution_provider_get_type (void)
       {GST_ONNX_EXECUTION_PROVIDER_MIGRAPHX,
             "AMD MIGraphX execution provider (compiled out, will use CPU)",
           "migraphx"},
+#endif
+
+#if HAVE_ORT_REGISTER_EXECUTION_PROVIDER_LIBRARY
+      /**
+       * GstOnnxExecutionProvider::hip
+       *
+       * AMD HIP execution provider
+       *
+       * Since: 1.30
+       */
+
+      {GST_ONNX_EXECUTION_PROVIDER_HIP,
+            "AMD HIP execution provider",
+          "hip"},
+#else
+      {GST_ONNX_EXECUTION_PROVIDER_HIP,
+            "AMD HIP execution provider (requires ONNX Runtime >= 1.22)",
+          "hip"},
+#endif
+#if HAVE_DIRECTML
+      /**
+       * GstOnnxExecutionProvider::dml
+       *
+       * Microsoft DirectML execution provider
+       *
+       * Since: 1.30
+       */
+      {GST_ONNX_EXECUTION_PROVIDER_DIRECTML,
+          "Microsoft DirectML execution provider", "dml"},
+#else
+      {GST_ONNX_EXECUTION_PROVIDER_DIRECTML,
+            "Microsoft DirectML execution provider (compiled out, will use CPU)",
+          "dml"},
 #endif
       {0, NULL, NULL},
     };
@@ -385,7 +441,7 @@ gst_onnx_inference_class_init (GstOnnxInferenceClass * klass)
    * GstOnnxInference:device
    *
    * Device identifier to use for inference, interpreted per execution provider.
-   * For CUDA and MIGraphX this is the integer device index (e.g. "0").
+   * For CUDA, MIGraphX and HIP this is the integer device index (e.g. "0").
    * When NULL (the default) the execution provider default is used.
    *
    * Since: 1.30
@@ -411,6 +467,8 @@ gst_onnx_inference_class_init (GstOnnxInferenceClass * klass)
       GST_DEBUG_FUNCPTR (gst_onnx_inference_transform_caps);
   basetransform_class->set_caps =
       GST_DEBUG_FUNCPTR (gst_onnx_inference_set_caps);
+  basetransform_class->propose_allocation =
+      GST_DEBUG_FUNCPTR (gst_onnx_inference_propose_allocation);
   basetransform_class->start = GST_DEBUG_FUNCPTR (gst_onnx_inference_start);
   basetransform_class->stop = GST_DEBUG_FUNCPTR (gst_onnx_inference_stop);
 
@@ -455,6 +513,8 @@ gst_onnx_inference_finalize (GObject * object)
   g_free (self->device);
   g_free (self->scales);
   g_free (self->offsets);
+  g_free (self->input_dims_model);
+  g_free (self->input_dims_runtime);
   gst_caps_unref (self->input_tensors_caps);
   gst_caps_unref (self->output_tensors_caps);
   G_OBJECT_CLASS (gst_onnx_inference_parent_class)->finalize (object);
@@ -712,6 +772,7 @@ _guess_tensor_data_type (GstOnnxInference * self, gsize dims_count,
   self->width_dim = -1;
   self->channels_dim = -1;
   self->batch_dim = -1;
+  self->planar = FALSE;
 
   if (dims_count < 2 || dims_count > 4) {
     GST_ERROR_OBJECT (self,
@@ -724,23 +785,29 @@ _guess_tensor_data_type (GstOnnxInference * self, gsize dims_count,
       *gst_format = "GRAY8";
       self->height_dim = 0;
       self->width_dim = 1;
+      self->planar = FALSE;
       break;
     case 3:
       if (dims[0] == 1 || dims[0] == 3) {
         self->channels_dim = 0;
         if (dims[0] == 1) {
           *gst_format = "GRAY8";
+          self->planar = FALSE;
         } else {
           *gst_format = "RGBP";
+          self->planar = TRUE;
         }
         self->height_dim = 1;
         self->width_dim = 2;
       } else if (dims[2] == 1 || dims[2] == 3) {
         self->channels_dim = 2;
-        if (dims[2] == 1)
-          *gst_format = "GRAY";
-        else
+        if (dims[2] == 1) {
+          *gst_format = "GRAY8";
+          self->planar = FALSE;
+        } else {
           *gst_format = "RGB";
+          self->planar = FALSE;
+        }
         self->height_dim = 0;
         self->width_dim = 1;
       } else {
@@ -755,10 +822,12 @@ _guess_tensor_data_type (GstOnnxInference * self, gsize dims_count,
         self->channels_dim = 1;
         self->height_dim = 2;
         self->width_dim = 3;
+        self->planar = TRUE;
       } else if (dims[3] == 1 || dims[3] == 3) {
         self->height_dim = 1;
         self->width_dim = 2;
         self->channels_dim = 3;
+        self->planar = FALSE;
       } else {
         GST_ERROR_OBJECT (self, "Don't know how to interpret dims");
         return FALSE;
@@ -766,6 +835,7 @@ _guess_tensor_data_type (GstOnnxInference * self, gsize dims_count,
 
       if (dims[self->channels_dim] == 1) {
         *gst_format = "GRAY8";
+        self->planar = FALSE;
       } else if (dims[self->channels_dim] == 3) {
         if (self->planar)
           *gst_format = "RGBP";
@@ -805,6 +875,101 @@ done:
   return g_string_free (dims_gstr, FALSE);
 }
 
+#if HAVE_ORT_REGISTER_EXECUTION_PROVIDER_LIBRARY
+static gboolean
+gst_onnx_inference_append_ep (GstOnnxInference * self, OrtSessionOptions * opts,
+    const gchar * ep_name)
+{
+  const OrtEpDevice *const *ep_devices = NULL;
+  const OrtEpDevice **target_devices = NULL;
+  size_t num_ep_devices = 0;
+  size_t num_target_devices = 0;
+  size_t i;
+  OrtStatus *status;
+
+  status = api->GetEpDevices (self->env, &ep_devices, &num_ep_devices);
+  if (status) {
+    GST_ERROR_OBJECT (self, "Failed to get EP devices: %s",
+        api->GetErrorMessage (status));
+    return FALSE;
+  }
+
+  target_devices = g_new (const OrtEpDevice *, num_ep_devices);
+  for (i = 0; i < num_ep_devices; i++) {
+    const char *dev_name = api->EpDevice_EpName (ep_devices[i]);
+    if (g_strcmp0 (dev_name, ep_name) == 0) {
+      // Apply card_idx filter if specified, otherwise pass all devices to
+      // the EP and let it select whatever makes sense.
+      if (self->device) {
+        const OrtHardwareDevice *hwdev = api->EpDevice_Device (ep_devices[i]);
+        const OrtKeyValuePairs *metadata = api->HardwareDevice_Metadata (hwdev);
+        const char *card_idx_str = NULL;
+        gint64 requested;
+        gint64 actual;
+
+        if (metadata) {
+          const char *const *keys = NULL;
+          const char *const *values = NULL;
+          size_t num_entries = 0;
+          size_t j;
+
+          api->GetKeyValuePairs (metadata, &keys, &values, &num_entries);
+          GST_LOG_OBJECT (self, "Metadata entries for EP %s: %" G_GSIZE_FORMAT,
+              ep_name, num_entries);
+
+          for (j = 0; j < num_entries; j++)
+            GST_LOG_OBJECT (self, "  %s = %s", keys[j], values[j]);
+
+          if (g_strcmp0 (ep_name, "hipgpu") == 0) {
+            card_idx_str = api->GetKeyValue (metadata, "card_idx");
+          } else if (g_strcmp0 (ep_name, "MIGraphXExecutionProvider") == 0) {
+            /* MIGraphX EP on Windows reports DXGI LUID and adapter number.
+             * Use adapter number here */
+            card_idx_str = api->GetKeyValue (metadata, "DxgiAdapterNumber");
+          }
+        }
+
+        if (!card_idx_str)
+          continue;
+
+        requested = g_ascii_strtoll (self->device, NULL, 10);
+        actual = g_ascii_strtoll (card_idx_str, NULL, 10);
+        GST_DEBUG_OBJECT (self,
+            "card_idx=%" G_GINT64_FORMAT " for device %" G_GSIZE_FORMAT,
+            actual, i);
+        if (requested != actual)
+          continue;
+      }
+      target_devices[num_target_devices++] = ep_devices[i];
+    }
+  }
+
+  if (num_target_devices == 0) {
+    if (self->device) {
+      GST_ERROR_OBJECT (self,
+          "No %s devices found matching card_idx %s", ep_name, self->device);
+    } else {
+      GST_ERROR_OBJECT (self, "No %s devices found", ep_name);
+    }
+    g_free (target_devices);
+    return FALSE;
+  }
+  // Finally, append EP to session options.
+  status =
+      api->SessionOptionsAppendExecutionProvider_V2 (opts,
+      self->env, target_devices, num_target_devices, NULL, NULL, 0);
+  g_free (target_devices);
+
+  if (status) {
+    GST_ERROR_OBJECT (self, "Failed to append %s EP: %s",
+        ep_name, api->GetErrorMessage (status));
+    return FALSE;
+  }
+
+  return TRUE;
+}
+#endif
+
 static gboolean
 gst_onnx_inference_start (GstBaseTransform * trans)
 {
@@ -828,6 +993,12 @@ gst_onnx_inference_start (GstBaseTransform * trans)
   gdouble *input_mins;
   gdouble *input_maxs;
 
+  if (!api) {
+    GST_ELEMENT_ERROR (self, LIBRARY, FAILED, (NULL),
+        ("ORT_API_VERSION %d not supported by ONNX runtime", ORT_API_VERSION));
+    return FALSE;
+  }
+
   GST_OBJECT_LOCK (self);
   if (self->session) {
     ret = TRUE;
@@ -835,9 +1006,10 @@ gst_onnx_inference_start (GstBaseTransform * trans)
   }
 
   if (self->model_file == NULL) {
+    GST_OBJECT_UNLOCK (self);
     GST_ELEMENT_ERROR (self, STREAM, FAILED, (NULL),
         ("model-file property not set"));
-    goto done;
+    goto error_no_lock;
   }
 
   modelinfo = gst_analytics_modelinfo_load (self->model_file);
@@ -846,11 +1018,6 @@ gst_onnx_inference_start (GstBaseTransform * trans)
         "This could be due to: file not found, unsupported version, "
         "or invalid file format.", self->model_file);
     goto error;
-  }
-
-  if (self->session) {
-    ret = TRUE;
-    goto done;
   }
   // Create environment
   OrtLoggingLevel ort_logging;
@@ -911,10 +1078,11 @@ gst_onnx_inference_start (GstBaseTransform * trans)
 
   status = api->SetSessionGraphOptimizationLevel (session_options, onnx_optim);
   if (status) {
+    GST_OBJECT_UNLOCK (self);
     GST_ELEMENT_ERROR (self, STREAM, FAILED, (NULL),
         ("Failed to set optimization level: %s",
             api->GetErrorMessage (status)));
-    goto error;
+    goto error_no_lock;
   }
   // Set execution provider
   switch (self->execution_provider) {
@@ -951,7 +1119,7 @@ gst_onnx_inference_start (GstBaseTransform * trans)
       break;
     }
     case GST_ONNX_EXECUTION_PROVIDER_VSI:
-#ifdef HAVE_VSI_NPU
+#if HAVE_VSI_NPU
       status =
           OrtSessionOptionsAppendExecutionProvider_VSINPU (session_options);
       if (status) {
@@ -966,7 +1134,7 @@ gst_onnx_inference_start (GstBaseTransform * trans)
 #endif
       break;
     case GST_ONNX_EXECUTION_PROVIDER_MIGRAPHX:
-#ifdef HAVE_MIGRAPHX
+#if HAVE_MIGRAPHX
     {
       OrtMIGraphXProviderOptions migraphx_options;
       memset (&migraphx_options, 0, sizeof (migraphx_options));
@@ -984,8 +1152,111 @@ gst_onnx_inference_start (GstBaseTransform * trans)
         goto error;
       }
     }
+#elif HAVE_WINML
+    {
+      ORTCHAR_T *lib_path_w;
+      gchar *lib_path =
+          gst_onnx_winml_ep_catalog_find ("MIGraphXExecutionProvider");
+      if (!lib_path) {
+        GST_ERROR_OBJECT (self, "Couldn't prepare MIGraphX EP via WindowsML");
+        goto error;
+      }
+
+      lib_path_w =
+          (ORTCHAR_T *) g_utf8_to_utf16 (lib_path, -1, NULL, NULL, NULL);
+      status = api->RegisterExecutionProviderLibrary (self->env,
+          "MIGraphXExecutionProvider", lib_path_w);
+      g_free (lib_path_w);
+
+      if (status) {
+        GST_ERROR_OBJECT (self, "Failed to register MIGraphX library (%s): %s",
+            lib_path, api->GetErrorMessage (status));
+        g_free (lib_path);
+        goto error;
+      }
+      g_free (lib_path);
+
+      self->registered_ep_name = "MIGraphXExecutionProvider";
+
+      if (!gst_onnx_inference_append_ep (self,
+              session_options, "MIGraphXExecutionProvider")) {
+        goto error;
+      }
+    }
 #else
       GST_ERROR_OBJECT (self, "Compiled without MIGraphX support");
+      goto error;
+#endif
+      break;
+    case GST_ONNX_EXECUTION_PROVIDER_HIP:
+#if HAVE_ORT_REGISTER_EXECUTION_PROVIDER_LIBRARY
+    {
+      const gchar *ep_lib_path = g_getenv ("MORPHIZEN_EP_LIB");
+
+      if (!ep_lib_path || !*ep_lib_path) {
+        GST_ERROR_OBJECT (self,
+            "MORPHIZEN_EP_LIB environment variable not set");
+        goto error;
+      }
+      // First register the EP library.
+#ifdef G_OS_WIN32
+      {
+        ORTCHAR_T *lib_path_w =
+            (ORTCHAR_T *) g_utf8_to_utf16 (ep_lib_path, -1, NULL, NULL, NULL);
+        status = api->RegisterExecutionProviderLibrary (self->env, "hipgpu",
+            lib_path_w);
+        g_free (lib_path_w);
+      }
+#else
+      status = api->RegisterExecutionProviderLibrary (self->env, "hipgpu",
+          ep_lib_path);
+#endif
+      if (status) {
+        GST_ERROR_OBJECT (self, "Failed to register HIP EP library (%s): %s",
+            ep_lib_path, api->GetErrorMessage (status));
+        goto error;
+      }
+
+      self->registered_ep_name = "hipgpu";
+
+      if (!gst_onnx_inference_append_ep (self, session_options, "hipgpu"))
+        goto error;
+    }
+#else
+      GST_ERROR_OBJECT (self,
+          "HIP execution provider requires ONNX Runtime >= 1.22");
+      goto error;
+#endif
+      break;
+    case GST_ONNX_EXECUTION_PROVIDER_DIRECTML:
+#if HAVE_DIRECTML
+    {
+      guint device_id = 0;
+      GstD3D12Device *device12;
+      GstOnnxDmlCtx *dml_ctx;
+
+      if (self->device)
+        device_id = (guint) g_ascii_strtoll (self->device, NULL, 10);
+
+      device12 = gst_d3d12_device_new (device_id);
+      if (!device12) {
+        GST_ERROR_OBJECT (self,
+            "Couldn't create D3D12 device with adapter index %d", device_id);
+        goto error;
+      }
+
+      dml_ctx = gst_onnx_dml_create_context (device12, session_options);
+      gst_object_unref (device12);
+      if (!dml_ctx) {
+        GST_ERROR_OBJECT (self,
+            "Couldn't create DML context with adapter index %d", device_id);
+        goto error;
+      }
+
+      self->dml_ctx = dml_ctx;
+    }
+#else
+      GST_ERROR_OBJECT (self, "Compiled without DirectML support");
       goto error;
 #endif
       break;
@@ -994,8 +1265,20 @@ gst_onnx_inference_start (GstBaseTransform * trans)
   }
 
   // Create session
-  status = api->CreateSession (self->env, self->model_file, session_options,
-      &self->session);
+  {
+    ORTCHAR_T *model_file;
+#ifdef G_OS_WIN32
+    model_file = (ORTCHAR_T *) g_utf8_to_utf16 (self->model_file, -1, NULL,
+        NULL, NULL);
+#else
+    model_file = self->model_file;
+#endif
+    status = api->CreateSession (self->env, model_file, session_options,
+        &self->session);
+#ifdef G_OS_WIN32
+    g_free (model_file);
+#endif
+  }
   if (status) {
     GST_ERROR_OBJECT (self, "Failed to create session: %s",
         api->GetErrorMessage (status));
@@ -1076,7 +1359,6 @@ gst_onnx_inference_start (GstBaseTransform * trans)
   self->width = gst_input_dims[self->width_dim];
   if (self->channels_dim >= 0) {
     self->channels = gst_input_dims[self->channels_dim];
-    self->planar = (self->channels_dim != num_input_dims - 1);
   } else {
     self->channels = 1;
   }
@@ -1092,7 +1374,7 @@ gst_onnx_inference_start (GstBaseTransform * trans)
 
   status = api->SessionGetOutputCount (self->session, &self->output_count);
   if (status) {
-    GST_ERROR_OBJECT (self, "Could to retrieve output count: %s",
+    GST_ERROR_OBJECT (self, "Failed to retrieve output count: %s",
         api->GetErrorMessage (status));
     goto error;
   }
@@ -1114,11 +1396,21 @@ gst_onnx_inference_start (GstBaseTransform * trans)
   input_type_info = NULL;
 
   self->input_data_type = onnx_data_type_to_gst (element_type);
-  if (self->input_data_type == -1
-      || get_tensor_type_size (self->input_data_type) == 0) {
+  if (self->input_data_type == -1) {
     GST_ERROR_OBJECT (self, "Unsupported input tensor data type %d",
         element_type);
     goto error;
+  }
+
+  /* Only u8 / f32 inputs are supported right now */
+  switch (self->input_data_type) {
+    case GST_TENSOR_DATA_TYPE_UINT8:
+    case GST_TENSOR_DATA_TYPE_FLOAT32:
+      break;
+    default:
+      GST_ERROR_OBJECT (self, "Unsupported input tensor data type %d",
+          element_type);
+      goto error;
   }
 
   /* Get input tensor name from ONNX file */
@@ -1180,8 +1472,12 @@ gst_onnx_inference_start (GstBaseTransform * trans)
   }
 
   g_free (tensor_name);
-  if (onnx_input_tensor_name)
-    self->allocator->Free (self->allocator, (char *) onnx_input_tensor_name);
+
+  self->input_name = (gchar *) onnx_input_tensor_name;
+  self->input_dims_count = num_input_dims;
+  self->input_dims_model =
+      g_memdup2 (input_dims, num_input_dims * sizeof (int64_t));
+  self->input_dims_runtime = g_new0 (int64_t, num_input_dims);
 
   /* Setting input tensor caps */
   self->input_tensors_caps = gst_caps_make_writable (self->input_tensors_caps);
@@ -1189,21 +1485,9 @@ gst_onnx_inference_start (GstBaseTransform * trans)
   gst_caps_set_simple (self->input_tensors_caps, "pixel-aspect-ratio",
       GST_TYPE_FRACTION, 1, 1, NULL);
 
-  /* Check if all channels are passthrough (scale=1.0, offset=0.0) */
-  gboolean is_passthrough = TRUE;
-  if (self->scales && self->offsets) {
-    for (i = 0; i < self->channels; i++) {
-      if (self->scales[i] != 1.0 || self->offsets[i] != 0.0) {
-        is_passthrough = FALSE;
-        break;
-      }
-    }
-  }
+  gst_caps_set_simple (self->input_tensors_caps, "format", G_TYPE_STRING,
+      gst_format, NULL);
 
-  if (self->input_data_type == GST_TENSOR_DATA_TYPE_UINT8 && gst_format &&
-      is_passthrough)
-    gst_caps_set_simple (self->input_tensors_caps, "format", G_TYPE_STRING,
-        gst_format, NULL);
   if (self->fixedInputImageSize)
     gst_caps_set_simple (self->input_tensors_caps, "width", G_TYPE_INT,
         self->width, "height", G_TYPE_INT, self->height, NULL);
@@ -1285,18 +1569,15 @@ gst_onnx_inference_start (GstBaseTransform * trans)
 
     /* Get dimensions from ONNX */
     int64_t *shape = (int64_t *) g_alloca (card * sizeof (int64_t));
-    output_dims = (gsize *) g_malloc0 (card * sizeof (gsize));
     status = api->GetDimensions (output_tensor_info, shape, card);
     if (status) {
       GST_ERROR_OBJECT (self, "Failed to get output tensor (%s) dimensions",
           self->output_names[i]);
-      api->ReleaseStatus (status);
-      status = NULL;
-      g_free (output_dims);
       api->ReleaseTypeInfo (output_type_info);
       goto error;
     }
 
+    output_dims = (gsize *) g_malloc0 (card * sizeof (gsize));
     for (j = 0; j < card; j++) {
       output_dims[j] = shape[j] > 0 ? shape[j] : G_MAXSIZE;
     }
@@ -1449,6 +1730,8 @@ done:
   return ret;
 
 error:
+  GST_OBJECT_UNLOCK (self);
+error_no_lock:
   if (status)
     api->ReleaseStatus (status);
   if (input_type_info)
@@ -1458,7 +1741,6 @@ error:
 
   if (modelinfo)
     gst_analytics_modelinfo_free (modelinfo);
-  GST_OBJECT_UNLOCK (self);
 
   gst_onnx_inference_stop (trans);
   return ret;
@@ -1497,10 +1779,29 @@ gst_onnx_inference_stop (GstBaseTransform * trans)
     api->ReleaseSession (self->session);
   self->session = NULL;
 
+  /* Free cached input tensor metadata */
+  if (self->input_name) {
+    self->allocator->Free (self->allocator, self->input_name);
+    self->input_name = NULL;
+  }
+  g_free (self->input_dims_model);
+  self->input_dims_model = NULL;
+  g_free (self->input_dims_runtime);
+  self->input_dims_runtime = NULL;
+  self->input_dims_count = 0;
+
   self->allocator = NULL;
 
-  if (self->env)
+  if (self->env) {
+#if HAVE_ORT_REGISTER_EXECUTION_PROVIDER_LIBRARY
+    if (self->registered_ep_name) {
+      (void) api->UnregisterExecutionProviderLibrary (self->env,
+          self->registered_ep_name);
+    }
+    self->registered_ep_name = NULL;
+#endif
     api->ReleaseEnv (self->env);
+  }
   self->env = NULL;
 
   g_free (self->dest);
@@ -1515,6 +1816,10 @@ gst_onnx_inference_stop (GstBaseTransform * trans)
   self->input_tensors_caps = gst_caps_new_empty_simple ("video/x-raw");
   gst_caps_unref (self->output_tensors_caps);
   self->output_tensors_caps = gst_caps_new_empty_simple ("video/x-raw");
+
+#if HAVE_DIRECTML
+  g_clear_pointer (&self->dml_ctx, gst_onnx_dml_free_context);
+#endif
 
   GST_OBJECT_UNLOCK (self);
 
@@ -1560,250 +1865,227 @@ gst_onnx_inference_set_caps (GstBaseTransform * trans, GstCaps * incaps,
     return FALSE;
   }
 
-  self->input_tensor_size = input_tensor_size;
-
-  if (self->dest == NULL || self->width * self->height !=
-      self->video_info.width * self->video_info.height) {
+  if (self->dest == NULL || self->input_tensor_size != input_tensor_size) {
     g_free (self->dest);
     self->dest = g_malloc (input_tensor_size);
   }
   self->width = self->video_info.width;
   self->height = self->video_info.height;
+  self->input_tensor_size = input_tensor_size;
+
+  /* Resolve dynamic input dimensions and validate fixed ones */
+  memcpy (self->input_dims_runtime, self->input_dims_model,
+      self->input_dims_count * sizeof (int64_t));
+
+  if (self->batch_dim >= 0)
+    self->input_dims_runtime[self->batch_dim] = 1;
+
+  if (self->input_dims_runtime[self->height_dim] >= 0) {
+    if (self->input_dims_runtime[self->height_dim] != self->height) {
+      GST_ERROR_OBJECT (self, "Caps have height %d, but model expects %"
+          G_GINT64_FORMAT, self->height,
+          self->input_dims_runtime[self->height_dim]);
+      return FALSE;
+    }
+  } else {
+    self->input_dims_runtime[self->height_dim] = self->height;
+  }
+
+  if (self->input_dims_runtime[self->width_dim] >= 0) {
+    if (self->input_dims_runtime[self->width_dim] != self->width) {
+      GST_ERROR_OBJECT (self, "Caps have width %d, but model expects %"
+          G_GINT64_FORMAT, self->width,
+          self->input_dims_runtime[self->width_dim]);
+      return FALSE;
+    }
+  } else {
+    self->input_dims_runtime[self->width_dim] = self->width;
+  }
 
   return TRUE;
 }
 
-#define _convert_image_scale_offset(Type)                               \
-G_STMT_START {                                                                \
-  size_t destIndex = 0;                                                       \
-  Type tmp;                                                                   \
-                                                                              \
-  if (!planar) {                                                              \
-    for (int32_t j = 0; j < dstHeight; ++j) {                                 \
-      for (int32_t i = 0; i < dstWidth; ++i) {                                \
-        for (int32_t k = 0; k < dstChannels; ++k) {                           \
-          tmp = *srcPtr[k];                                                   \
-          dst[destIndex++] = (Type)(tmp * scales[k] + offsets[k]);            \
-          srcPtr[k] += pixel_stride;                                    \
-        }                                                                     \
-      }                                                                       \
-      /* correct for stride */                                                \
-      for (uint32_t k = 0; k < dstChannels; ++k)                              \
-        srcPtr[k] += stride - pixel_stride * dstWidth;                  \
-    }                                                                         \
-  } else {                                                                    \
-    size_t frameSize = dstWidth * dstHeight;                                  \
-    Type *destPtr[3] = { dst, dst + frameSize, dst + 2 * frameSize };         \
-    for (int32_t j = 0; j < dstHeight; ++j) {                                 \
-      for (int32_t i = 0; i < dstWidth; ++i) {                                \
-        for (int32_t k = 0; k < dstChannels; ++k) {                           \
-          tmp = *srcPtr[k];                                                   \
-          destPtr[k][destIndex] = (Type)(tmp * scales[k] + offsets[k]);       \
-          srcPtr[k] += pixel_stride;                                    \
-        }                                                                     \
-        destIndex++;                                                          \
-      }                                                                       \
-      /* correct for stride */                                                \
-      for (uint32_t k = 0; k < dstChannels; ++k)                              \
-        srcPtr[k] += stride - pixel_stride * dstWidth;                  \
-    }                                                                         \
-  }                                                                           \
-}                                                                             \
-G_STMT_END;
-
-static void
-convert_image_scale_offset_u8 (guint8 * dst, gint dstWidth, gint dstHeight,
-    gint dstChannels, gboolean planar, guint8 ** srcPtr,
-    guint8 pixel_stride, guint32 stride, const gdouble * scales,
-    const gdouble * offsets)
+static gboolean
+gst_onnx_inference_propose_allocation (GstBaseTransform * trans,
+    GstQuery * decide_query, GstQuery * query)
 {
-  _convert_image_scale_offset (guint8);
+  if (!GST_BASE_TRANSFORM_CLASS
+      (gst_onnx_inference_parent_class)->propose_allocation (trans,
+          decide_query, query))
+    return FALSE;
+
+  gst_query_add_allocation_meta (query, GST_VIDEO_META_API_TYPE, NULL);
+
+  return TRUE;
 }
 
-static void
-convert_image_scale_offset_f32 (gfloat * dst, gint dstWidth, gint dstHeight,
-    gint dstChannels, gboolean planar, guint8 ** srcPtr,
-    guint8 pixel_stride, guint32 stride, const gdouble * scales,
-    const gdouble * offsets)
-{
-  _convert_image_scale_offset (gfloat);
+#define CONVERT_INTERLEAVED_FUNC(name, type, ncomps, clamp)                 \
+static void                                                                 \
+convert_image_ ##name##_##type (type * dst, const GstVideoFrame * vframe,   \
+    const gdouble * scales, const gdouble * offsets)                        \
+{                                                                           \
+  const guint8 *src = GST_VIDEO_FRAME_PLANE_DATA (vframe, 0);               \
+  gsize height = GST_VIDEO_FRAME_HEIGHT (vframe);                           \
+  gsize width = GST_VIDEO_FRAME_WIDTH (vframe);                             \
+  gsize stride = GST_VIDEO_FRAME_PLANE_STRIDE (vframe, 0);                  \
+  gsize row_size = width * ncomps;                                          \
+                                                                            \
+  for (size_t y = 0; y < height; y++) {                                     \
+    for (size_t x = 0; x < width; x++) {                                    \
+      for (size_t c = 0; c < ncomps; c++) {                                 \
+        dst[c] = clamp (src[c] * scales[c] + offsets[c]);                   \
+      }                                                                     \
+      src += ncomps;                                                        \
+      dst += ncomps;                                                        \
+    }                                                                       \
+    src += stride - row_size;                                               \
+  }                                                                         \
 }
+
+#define CONVERT_PLANAR_FUNC(name, type, ncomps, clamp)                      \
+static void                                                                 \
+convert_image_ ##name##_##type (type * dst, const GstVideoFrame * vframe,   \
+    const gdouble * scales, const gdouble * offsets)                        \
+{                                                                           \
+  gsize height = GST_VIDEO_FRAME_HEIGHT (vframe);                           \
+  gsize width = GST_VIDEO_FRAME_WIDTH (vframe);                             \
+                                                                            \
+  for (size_t c = 0; c < ncomps; c++) {                                     \
+    gsize stride = GST_VIDEO_FRAME_PLANE_STRIDE (vframe, c);                \
+    const guint8 *src = GST_VIDEO_FRAME_PLANE_DATA (vframe, c);             \
+    gsize row_size = width;                                                 \
+    for (size_t y = 0; y < height; y++) {                                   \
+      for (size_t x = 0; x < width; x++) {                                  \
+        *dst = clamp (*src * scales[c] + offsets[c]);                       \
+        dst++;                                                              \
+        src++;                                                              \
+      }                                                                     \
+      src += stride - row_size;                                             \
+    }                                                                       \
+  }                                                                         \
+}
+
+#define CLAMP_U8(x) ((uint8_t) CLAMP((x), 0.0, 255.0))
+#define CLAMP_F32(x) (x)
+
+CONVERT_INTERLEAVED_FUNC (gray, uint8_t, 1, CLAMP_U8);
+CONVERT_INTERLEAVED_FUNC (gray, float, 1, CLAMP_F32);
+CONVERT_INTERLEAVED_FUNC (rgb, uint8_t, 3, CLAMP_U8);
+CONVERT_INTERLEAVED_FUNC (rgb, float, 3, CLAMP_F32);
+
+CONVERT_PLANAR_FUNC (rgbp, uint8_t, 3, CLAMP_U8);
+CONVERT_PLANAR_FUNC (rgbp, float, 3, CLAMP_F32);
 
 static GstFlowReturn
 gst_onnx_inference_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
 {
   GstOnnxInference *self = GST_ONNX_INFERENCE (trans);
-  GstMapInfo info;
+  GstVideoFrame vframe = GST_VIDEO_FRAME_INIT;
   OrtStatus *status = NULL;
-  OrtTypeInfo *input_type_info = NULL;
   OrtValue *input_tensor = NULL;
   OrtValue **output_tensors = NULL;
-  const OrtTensorTypeAndShapeInfo *input_tensor_info;
-  size_t num_dims;
-  int64_t *input_dims;
-  uint8_t *srcPtr[3];
-  char *input_names[1] = { NULL };
   GstTensorMeta *tmeta = NULL;
   OrtTensorTypeAndShapeInfo *output_tensor_info = NULL;
 
-  if (!gst_buffer_map (buf, &info, GST_MAP_READ)) {
+  if (!gst_video_frame_map (&vframe, &self->video_info, buf,
+          GST_MAP_READ | GST_VIDEO_FRAME_MAP_FLAG_NO_REF)) {
     GST_ELEMENT_ERROR (trans, STREAM, FAILED, (NULL),
         ("Could not map input buffer"));
     return GST_FLOW_ERROR;
   }
 
-  status =
-      api->SessionGetInputName (self->session, 0, self->allocator, input_names);
-  if (status) {
-    GST_ELEMENT_ERROR (self, STREAM, FAILED, (NULL),
-        ("Failed to get input name"));
-    goto error;
-  }
-
-  status = api->SessionGetInputTypeInfo (self->session, 0, &input_type_info);
-  if (status) {
-    GST_ELEMENT_ERROR (self, STREAM, FAILED, (NULL),
-        ("Failed to get input type info: %s", api->GetErrorMessage (status)));
-    goto error;
-  }
-
-  status = api->CastTypeInfoToTensorInfo (input_type_info, &input_tensor_info);
-  if (status) {
-    GST_ELEMENT_ERROR (self, STREAM, FAILED, (NULL),
-        ("Failed to cast type info: %s", api->GetErrorMessage (status)));
-    goto error;
-  }
-
-  status = api->GetDimensionsCount (input_tensor_info, &num_dims);
-  if (status) {
-    GST_ELEMENT_ERROR (self, STREAM, FAILED, (NULL),
-        ("Failed to get dimensions count: %s", api->GetErrorMessage (status)));
-    goto error;
-  }
-
-  input_dims = (int64_t *) g_alloca (num_dims * sizeof (int64_t));
-  status = api->GetDimensions (input_tensor_info, input_dims, num_dims);
-  if (status) {
-    GST_ELEMENT_ERROR (self, STREAM, FAILED, (NULL),
-        ("Failed to get dimensions: %s", api->GetErrorMessage (status)));
-    goto error;
-  }
-
-  api->ReleaseTypeInfo (input_type_info);
-  input_type_info = NULL;
-
-  if (self->batch_dim >= 0)
-    input_dims[self->batch_dim] = 1;
-
-  if (input_dims[self->height_dim] >= 0) {
-    if (input_dims[self->height_dim] != self->height) {
-      GST_ELEMENT_ERROR (self, STREAM, FAILED, (NULL),
-          ("Buffer has height %d, but model expects %" G_GINT64_FORMAT,
-              self->height, input_dims[self->height_dim]));
-      goto error;
-    }
-  } else {
-    input_dims[self->height_dim] = self->height;
-  }
-  if (input_dims[self->width_dim] >= 0) {
-    if (input_dims[self->width_dim] != self->width) {
-      GST_ELEMENT_ERROR (self, STREAM, FAILED, (NULL),
-          ("Buffer has width %d, but model expects %" G_GINT64_FORMAT,
-              self->width, input_dims[self->width_dim]));
-      goto error;
-    }
-  } else {
-    input_dims[self->width_dim] = self->width;
-  }
-
   GST_LOG_OBJECT (self, "Input dimensions: %" G_GINT64_FORMAT
       ":%" G_GINT64_FORMAT ":%" G_GINT64_FORMAT ":%" G_GINT64_FORMAT,
-      num_dims > 0 ? input_dims[0] : -1, num_dims > 1 ? input_dims[1] : -1,
-      num_dims > 2 ? input_dims[2] : -1, num_dims > 3 ? input_dims[3] : -1);
-
-  // copy video frame
-  switch (self->video_info.finfo->format) {
-    case GST_VIDEO_FORMAT_RGBA:
-      srcPtr[0] = info.data;
-      srcPtr[1] = info.data + 1;
-      srcPtr[2] = info.data + 2;
-      break;
-    case GST_VIDEO_FORMAT_BGRA:
-      srcPtr[0] = info.data + 2;
-      srcPtr[1] = info.data + 1;
-      srcPtr[2] = info.data + 0;
-      break;
-    case GST_VIDEO_FORMAT_ARGB:
-      srcPtr[0] = info.data + 1;
-      srcPtr[1] = info.data + 2;
-      srcPtr[2] = info.data + 3;
-      break;
-    case GST_VIDEO_FORMAT_ABGR:
-      srcPtr[0] = info.data + 3;
-      srcPtr[1] = info.data + 2;
-      srcPtr[2] = info.data + 1;
-      break;
-    case GST_VIDEO_FORMAT_RGB:
-      srcPtr[0] = info.data;
-      srcPtr[1] = info.data + 1;
-      srcPtr[2] = info.data + 2;
-      break;
-    case GST_VIDEO_FORMAT_BGR:
-      srcPtr[0] = info.data + 2;
-      srcPtr[1] = info.data + 1;
-      srcPtr[2] = info.data + 0;
-      break;
-    default:
-      g_assert_not_reached ();
-      break;
-  }
-
-  /* Check if all channels are passthrough (scale=1.0, offset=0.0) */
-  gboolean is_passthrough_transform = TRUE;
-  if (self->scales && self->offsets) {
-    for (gsize c = 0; c < self->channels; c++) {
-      if (self->scales[c] != 1.0 || self->offsets[c] != 0.0) {
-        is_passthrough_transform = FALSE;
-        break;
-      }
-    }
-  }
-
-  /* Interleaved, multi-channel data is never passthrough but needs conversion */
-  if (!self->planar && self->channels != 1)
-    is_passthrough_transform = FALSE;
+      self->input_dims_count > 0 ? self->input_dims_runtime[0] : -1,
+      self->input_dims_count > 1 ? self->input_dims_runtime[1] : -1,
+      self->input_dims_count > 2 ? self->input_dims_runtime[2] : -1,
+      self->input_dims_count > 3 ? self->input_dims_runtime[3] : -1);
 
   switch (self->input_data_type) {
     case GST_TENSOR_DATA_TYPE_UINT8:{
       uint8_t *src_data;
 
-      if (is_passthrough_transform) {
-        src_data = info.data;
+      gboolean needs_conversion = FALSE;
+
+      /* Check if conversion is needed based on scales/offsets */
+      for (int32_t i = 0; i < self->channels; i++) {
+        if (fabs (self->scales[i] - 1.0) > 0.001
+            || fabs (self->offsets[i]) > 0.001) {
+          needs_conversion = TRUE;
+          break;
+        }
+      }
+      /* Check if conversion is needed based on strides / plane offsets.
+       * ONNX needs tightly packed data */
+      void (*convert) (guint8 * dst, const GstVideoFrame * vframe,
+          const gdouble * scales, const gdouble * offsets) = NULL;
+      switch (GST_VIDEO_FRAME_FORMAT (&vframe)) {
+        case GST_VIDEO_FORMAT_RGB:
+          needs_conversion = needs_conversion
+              || GST_VIDEO_FRAME_PLANE_STRIDE (&vframe, 0) != self->width * 3;
+          convert = convert_image_rgb_uint8_t;
+          break;
+        case GST_VIDEO_FORMAT_RGBP:
+          needs_conversion = needs_conversion ||
+              GST_VIDEO_FRAME_PLANE_STRIDE (&vframe, 0) != self->width ||
+              GST_VIDEO_FRAME_PLANE_STRIDE (&vframe, 1) != self->width ||
+              GST_VIDEO_FRAME_PLANE_STRIDE (&vframe, 2) != self->width ||
+              GST_VIDEO_FRAME_PLANE_DATA (&vframe,
+              1) != (guint8 *) GST_VIDEO_FRAME_PLANE_DATA (&vframe,
+              0) + self->width * self->height
+              || GST_VIDEO_FRAME_PLANE_DATA (&vframe,
+              2) != (guint8 *) GST_VIDEO_FRAME_PLANE_DATA (&vframe,
+              1) + self->width * self->height;
+          convert = convert_image_rgbp_uint8_t;
+          break;
+        case GST_VIDEO_FORMAT_GRAY8:
+          needs_conversion = needs_conversion
+              || GST_VIDEO_FRAME_PLANE_STRIDE (&vframe, 0) != self->width;
+          convert = convert_image_gray_uint8_t;
+          break;
+        default:
+          g_assert_not_reached ();
+          break;
+      }
+
+      if (!needs_conversion) {
+        src_data = GST_VIDEO_FRAME_PLANE_DATA (&vframe, 0);
       } else {
-        convert_image_scale_offset_u8 (self->dest, self->width, self->height,
-            self->channels, self->planar, srcPtr,
-            GST_VIDEO_INFO_COMP_PSTRIDE (&self->video_info, 0),
-            GST_VIDEO_INFO_PLANE_STRIDE (&self->video_info, 0),
-            self->scales, self->offsets);
+        convert (self->dest, &vframe, self->scales, self->offsets);
         src_data = self->dest;
       }
 
       status = api->CreateTensorWithDataAsOrtValue (self->memory_info, src_data,
-          self->input_tensor_size, input_dims, num_dims,
+          self->input_tensor_size, self->input_dims_runtime,
+          self->input_dims_count,
           ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8, &input_tensor);
       break;
     }
     case GST_TENSOR_DATA_TYPE_FLOAT32:{
-      convert_image_scale_offset_f32 ((float *) self->dest, self->width,
-          self->height,
-          self->channels, self->planar, srcPtr,
-          GST_VIDEO_INFO_COMP_PSTRIDE (&self->video_info, 0),
-          GST_VIDEO_INFO_PLANE_STRIDE (&self->video_info, 0),
-          self->scales, self->offsets);
+      /* F32 always needs conversion for now until we get suitable
+       * GstVideoFormats */
+      switch (GST_VIDEO_FRAME_FORMAT (&vframe)) {
+        case GST_VIDEO_FORMAT_RGB:
+          convert_image_rgb_float ((float *) self->dest, &vframe, self->scales,
+              self->offsets);
+          break;
+        case GST_VIDEO_FORMAT_RGBP:
+          convert_image_rgbp_float ((float *) self->dest, &vframe, self->scales,
+              self->offsets);
+          break;
+        case GST_VIDEO_FORMAT_GRAY8:
+          convert_image_gray_float ((float *) self->dest, &vframe, self->scales,
+              self->offsets);
+          break;
+        default:
+          g_assert_not_reached ();
+          break;
+      }
 
       status = api->CreateTensorWithDataAsOrtValue (self->memory_info,
           (float *) self->dest,
-          self->input_tensor_size, input_dims, num_dims,
+          self->input_tensor_size, self->input_dims_runtime,
+          self->input_dims_count,
           ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor);
       break;
     }
@@ -1821,7 +2103,8 @@ gst_onnx_inference_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
 
   output_tensors = g_new0 (OrtValue *, self->output_count);
 
-  status = api->Run (self->session, NULL, (const char *const *) input_names,
+  status =
+      api->Run (self->session, NULL, (const char *const *) &self->input_name,
       (const OrtValue * const *) &input_tensor, 1,
       (const char *const *) self->output_names, self->output_count,
       output_tensors);
@@ -1832,7 +2115,6 @@ gst_onnx_inference_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
     goto error;
   }
 
-  self->allocator->Free (self->allocator, input_names[0]);
   api->ReleaseValue (input_tensor);
 
   if (!output_tensors || self->output_count == 0) {
@@ -1938,17 +2220,13 @@ gst_onnx_inference_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
   g_free (output_tensors);
 
   GST_TRACE_OBJECT (trans, "Num tensors:%zu", self->output_count);
-  gst_buffer_unmap (buf, &info);
+  gst_video_frame_unmap (&vframe);
 
   return GST_FLOW_OK;
 
 error:
   if (status)
     api->ReleaseStatus (status);
-  if (input_names[0])
-    self->allocator->Free (self->allocator, input_names[0]);
-  if (input_type_info)
-    api->ReleaseTypeInfo (input_type_info);
   if (input_tensor)
     api->ReleaseValue (input_tensor);
   if (output_tensors) {
@@ -1966,7 +2244,7 @@ error:
     gst_buffer_remove_meta (buf, (GstMeta *) tmeta);
 
 
-  gst_buffer_unmap (buf, &info);
+  gst_video_frame_unmap (&vframe);
 
   return GST_FLOW_ERROR;
 }

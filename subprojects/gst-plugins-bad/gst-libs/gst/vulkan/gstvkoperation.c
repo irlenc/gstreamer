@@ -709,7 +709,7 @@ gst_vulkan_operation_wait (GstVulkanOperation * self)
 /**
  * gst_vulkan_operation_update_frame:
  * @self: a #GstVulkanOperation
- * @frame: a #GstBuffer to update after submit
+ * @frame: a Vulkan Image #GstBuffer to update after submit
  * @dst_stage: destination pipeline stage (VkPipelineStageFlags or
  *   VkPipelineStageFlags2)
  * @new_access: the new access flags (VkAccessFlags2 or VkAccessFlags)
@@ -735,6 +735,12 @@ gst_vulkan_operation_update_frame (GstVulkanOperation * self, GstBuffer * frame,
   guint n_mems = gst_buffer_n_memory (frame);
   for (int i = 0; i < n_mems; i++) {
     GstMemory *mem = gst_buffer_peek_memory (frame, i);
+
+    if (!gst_is_vulkan_image_memory (mem)) {
+      GST_ERROR_OBJECT (self, "Memory %" GST_PTR_FORMAT
+          " is not a Vulkan Image", mem);
+      return;
+    }
 
     gst_vulkan_barrier_state_update_image_barrier (priv->barriers,
         (GstVulkanImageMemory *) mem, dst_stage, new_access, new_layout,
@@ -776,6 +782,13 @@ gst_vulkan_operation_add_frame_barrier (GstVulkanOperation * self,
 
   for (int i = 0; i < n_mems; i++) {
     GstMemory *mem = gst_buffer_peek_memory (frame, i);
+
+    if (!gst_is_vulkan_image_memory (mem)) {
+      GST_ERROR_OBJECT (self, "Memory %" GST_PTR_FORMAT
+          " is not a Vulkan Image", mem);
+      return FALSE;
+    }
+
     if (!gst_vulkan_barrier_state_add_image_barrier (priv->barriers,
             (GstVulkanImageMemory *) mem, src_stage, dst_stage, new_access,
             new_layout, new_queue))
@@ -944,7 +957,7 @@ gst_vulkan_operation_add_dependency_frame (GstVulkanOperation * self,
  * gst_vulkan_operation_add_wait_semaphore:
  * @self: a #GstVulkanOperation
  * @semaphore: (transfer full): a semaphore
- * @stage: source pipeline stage (VkPipelineStageFlags or VkPipelinStageFlags2)
+ * @stage: source pipeline stage (VkPipelineStageFlags or VkPipelineStageFlags2)
  *
  * Adds @semaphore to the list of semaphores waited on in vkQueueSubmit/2.
  *
@@ -992,7 +1005,7 @@ gst_vulkan_operation_add_wait_semaphore (GstVulkanOperation * self,
  * gst_vulkan_operation_add_signal_semaphore:
  * @self: a #GstVulkanOperation
  * @semaphore: (transfer full): a semaphore
- * @stage: destination pipeline stage (VkPipelineStageFlags or VkPipelinStageFlags2)
+ * @stage: destination pipeline stage (VkPipelineStageFlags or VkPipelineStageFlags2)
  *
  * Adds @semaphore to the list of semaphores signalled by vkQueueSubmit/2.
  *
