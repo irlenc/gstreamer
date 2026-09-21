@@ -515,18 +515,16 @@ GST_START_TEST (test_video_formats_float)
     GST_VIDEO_FORMAT_RGBA_F16LE, GST_VIDEO_FORMAT_RGBA_F16BE,
     GST_VIDEO_FORMAT_RGBA_F32LE, GST_VIDEO_FORMAT_RGBA_F32BE,
   };
-  /* ARGB64 pixel whose components are exactly representable as half floats
-   * so the pack/unpack roundtrip is lossless for all float formats */
-  const guint16 argb64_in[] = { 0xffff, 0x4000, 0x8000, 0x2000 };
-  /* R, G, B, A rounded to the nearest IEEE 754 half float:
-   * 0.25, 0.5, 0.125, 1.0 */
+  /* ARGB_F32 order: A, R, G, B */
+  const gfloat argb_f32_in[] = { 1.0f, 0.25f, 0.5f, 0.125f };
+  /* R, G, B, A */
   const guint16 expected_half[] = { 0x3400, 0x3800, 0x3000, 0x3c00 };
   guint i, c;
 
   for (i = 0; i < G_N_ELEMENTS (float_formats); i++) {
     const GstVideoFormatInfo *finfo;
     GstVideoInfo vinfo;
-    guint16 argb64_out[4] = { 0, };
+    gfloat argb_f32_out[4] = { 0, };
     guint8 packed[16] = { 0, };
     gpointer data[GST_VIDEO_MAX_PLANES] = { packed, };
     gint stride[GST_VIDEO_MAX_PLANES] = { sizeof (packed), };
@@ -551,7 +549,7 @@ GST_START_TEST (test_video_formats_float)
         is_f16 ? 16 : 32);
     fail_unless_equals_int (GST_VIDEO_FORMAT_INFO_PSTRIDE (finfo, 0),
         is_f16 ? 8 : 16);
-    fail_unless_equals_int (finfo->unpack_format, GST_VIDEO_FORMAT_ARGB64);
+    fail_unless_equals_int (finfo->unpack_format, GST_VIDEO_FORMAT_ARGB_F32);
 
     fail_unless (gst_video_info_set_format (&vinfo, float_formats[i], 7, 5));
     fail_unless_equals_int (GST_VIDEO_INFO_PLANE_STRIDE (&vinfo, 0),
@@ -559,13 +557,13 @@ GST_START_TEST (test_video_formats_float)
     fail_unless_equals_int (GST_VIDEO_INFO_SIZE (&vinfo),
         7 * 5 * (is_f16 ? 8 : 16));
 
-    finfo->pack_func (finfo, GST_VIDEO_PACK_FLAG_NONE, (gpointer) argb64_in,
-        sizeof (argb64_in), data, stride, GST_VIDEO_CHROMA_SITE_UNKNOWN, 0, 1);
+    finfo->pack_func (finfo, GST_VIDEO_PACK_FLAG_NONE,
+        (gpointer) argb_f32_in, sizeof (argb_f32_in), data, stride,
+        GST_VIDEO_CHROMA_SITE_UNKNOWN, 0, 1);
 
-    /* verify component order and encoding in memory, 32-bit floats store
-     * the exact unnormalized value */
+    /* Verify component order and encoding in memory. */
     for (c = 0; c < 4; c++) {
-      gfloat expected_float = argb64_in[(c + 1) % 4] * (1.0f / 65535.0f);
+      gfloat expected_float = argb_f32_in[(c + 1) % 4];
 
       if (is_f16 && is_le) {
         fail_unless_equals_int_hex (GST_READ_UINT16_LE (packed + c * 2),
@@ -582,13 +580,13 @@ GST_START_TEST (test_video_formats_float)
       }
     }
 
-    finfo->unpack_func (finfo, GST_VIDEO_PACK_FLAG_NONE, argb64_out, data,
+    finfo->unpack_func (finfo, GST_VIDEO_PACK_FLAG_NONE, argb_f32_out, data,
         stride, 0, 0, 1);
 
     for (c = 0; c < 4; c++)
-      fail_unless_equals_int_hex (argb64_out[c], argb64_in[c]);
+      fail_unless_equals_float (argb_f32_out[c], argb_f32_in[c]);
 
-    /* out of range values are clamped to [0, 1] when unpacking */
+    /* out of range values are preserved by float unpacking */
     if (is_f16) {
       /* -2.0, 2.0, 65504.0 (max half), 1.0 */
       const guint16 oor[] = { 0xc000, 0x4000, 0x7bff, 0x3c00 };
@@ -610,49 +608,14 @@ GST_START_TEST (test_video_formats_float)
       }
     }
 
-    finfo->unpack_func (finfo, GST_VIDEO_PACK_FLAG_NONE, argb64_out, data,
+    finfo->unpack_func (finfo, GST_VIDEO_PACK_FLAG_NONE, argb_f32_out, data,
         stride, 0, 0, 1);
 
-    /* ARGB64 order: A, R, G, B <- R=-2.0, G=2.0, B=65504.0, A=1.0 */
-    fail_unless_equals_int_hex (argb64_out[0], 0xffff);
-    fail_unless_equals_int_hex (argb64_out[1], 0x0000);
-    fail_unless_equals_int_hex (argb64_out[2], 0xffff);
-    fail_unless_equals_int_hex (argb64_out[3], 0xffff);
-
-    /* every NaN maps to 0 and infinities saturate, on all unpack code
-     * paths; written as bit patterns so no intermediate FPU operation can
-     * quiet the signaling NaN */
-    if (is_f16) {
-      /* +NaN, signaling +NaN, -NaN, +inf */
-      const guint16 special[] = { 0x7e00, 0x7c01, 0xfe00, 0x7c00 };
-
-      for (c = 0; c < 4; c++) {
-        if (is_le)
-          GST_WRITE_UINT16_LE (packed + c * 2, special[c]);
-        else
-          GST_WRITE_UINT16_BE (packed + c * 2, special[c]);
-      }
-    } else {
-      /* +NaN, signaling +NaN, -NaN, +inf */
-      const guint32 special[] =
-          { 0x7fc00000, 0x7f800001, 0xffc00000, 0x7f800000 };
-
-      for (c = 0; c < 4; c++) {
-        if (is_le)
-          GST_WRITE_UINT32_LE (packed + c * 4, special[c]);
-        else
-          GST_WRITE_UINT32_BE (packed + c * 4, special[c]);
-      }
-    }
-
-    finfo->unpack_func (finfo, GST_VIDEO_PACK_FLAG_NONE, argb64_out, data,
-        stride, 0, 0, 1);
-
-    /* ARGB64 order: A, R, G, B <- R=+NaN, G=sNaN, B=-NaN, A=+inf */
-    fail_unless_equals_int_hex (argb64_out[0], 0xffff);
-    fail_unless_equals_int_hex (argb64_out[1], 0x0000);
-    fail_unless_equals_int_hex (argb64_out[2], 0x0000);
-    fail_unless_equals_int_hex (argb64_out[3], 0x0000);
+    /* ARGB_F32 order: A, R, G, B */
+    fail_unless_equals_float (argb_f32_out[0], 1.0f);
+    fail_unless_equals_float (argb_f32_out[1], -2.0f);
+    fail_unless_equals_float (argb_f32_out[2], 2.0f);
+    fail_unless_equals_float (argb_f32_out[3], 65504.0f);
   }
 }
 
@@ -1252,8 +1215,7 @@ GST_END_TEST;
 GST_START_TEST (test_video_convert_rgba_float_lossless)
 {
   /* HDR (> 1.0) and out-of-gamut (< 0.0) values, exact in both float and half
-   * float, so the roundtrip must be bit-exact (the generic ARGB64 path clamps
-   * to [0, 1]). */
+   * float, so the roundtrip must be bit-exact */
   const gfloat pixel[4] = { 4.0f, 0.5f, -0.25f, 1.0f };
   const struct
   {
@@ -1322,6 +1284,230 @@ GST_START_TEST (test_video_convert_rgba_float_lossless)
     gst_buffer_unref (f32buf);
     gst_buffer_unref (f16buf);
     gst_buffer_unref (backbuf);
+  }
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_video_convert_rgba_float)
+{
+  const GstVideoFormat formats[] = {
+    GST_VIDEO_FORMAT_ARGB,
+    GST_VIDEO_FORMAT_AYUV,
+    GST_VIDEO_FORMAT_ARGB64,
+    GST_VIDEO_FORMAT_AYUV64,
+  };
+  const gfloat pixel[] = {
+    1.0f,
+    64.0f / 255.0f,
+    128.0f / 255.0f,
+    192.0f / 255.0f,
+  };
+  guint i, j;
+  GstVideoInfo float_info;
+  GstVideoFrame src_frame;
+  GstBuffer *src_buf;
+  gfloat *data;
+
+  fail_unless (gst_video_info_set_format (&float_info,
+          GST_VIDEO_FORMAT_ARGB_F32, 1, 1));
+
+  src_buf = gst_buffer_new_and_alloc (float_info.size);
+  fail_unless (src_buf);
+  fail_unless (gst_video_frame_map (&src_frame,
+          &float_info, src_buf, GST_MAP_READWRITE));
+
+  data = GST_VIDEO_FRAME_PLANE_DATA (&src_frame, 0);
+  for (i = 0; i < 4; i++)
+    data[i] = pixel[i];
+
+  for (i = 0; i < G_N_ELEMENTS (formats); i++) {
+    GstVideoInfo info;
+    GstVideoFrame frame, dst_frame;
+    GstBuffer *buf, *dst_buf;
+    GstVideoConverter *to_int_conv, *to_float_conv;
+    gfloat *result;
+    gfloat tolerance;
+
+    if (formats[i] == GST_VIDEO_FORMAT_ARGB ||
+        formats[i] == GST_VIDEO_FORMAT_AYUV) {
+      tolerance = 2.0f / 255.0f;
+    } else {
+      tolerance = 2.0f / 65535.0f;
+    }
+
+    /* ARGB_F32 -> formats[i] -> ARGB_F32 */
+    fail_unless (gst_video_info_set_format (&info, formats[i], 1, 1));
+
+    buf = gst_buffer_new_and_alloc (info.size);
+    fail_unless (buf);
+    fail_unless (gst_video_frame_map (&frame, &info, buf, GST_MAP_READWRITE));
+
+    dst_buf = gst_buffer_new_and_alloc (float_info.size);
+    fail_unless (dst_buf);
+    fail_unless (gst_video_frame_map (&dst_frame,
+            &float_info, dst_buf, GST_MAP_READWRITE));
+
+    to_int_conv = gst_video_converter_new (&float_info, &info, NULL);
+    fail_unless (to_int_conv);
+
+    to_float_conv = gst_video_converter_new (&info, &float_info, NULL);
+    fail_unless (to_float_conv);
+
+    gst_video_converter_frame (to_int_conv, &src_frame, &frame);
+    gst_video_converter_frame (to_float_conv, &frame, &dst_frame);
+    gst_video_converter_free (to_int_conv);
+    gst_video_converter_free (to_float_conv);
+
+    result = GST_VIDEO_FRAME_PLANE_DATA (&dst_frame, 0);
+
+    for (j = 0; j < 4; j++) {
+      gfloat diff = ABS (result[j] - pixel[j]);
+
+      fail_unless (diff <= tolerance);
+    }
+
+    gst_video_frame_unmap (&frame);
+    gst_video_frame_unmap (&dst_frame);
+    gst_buffer_unref (buf);
+    gst_buffer_unref (dst_buf);
+  }
+
+  gst_video_frame_unmap (&src_frame);
+  gst_buffer_unref (src_buf);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_video_convert_float_to_integer_clamp)
+{
+  const struct
+  {
+    gboolean gamma;
+    gboolean primaries;
+    GstVideoTransferFunction in_transfer;
+    GstVideoColorPrimaries in_primaries;
+    GstVideoTransferFunction out_transfer;
+    GstVideoColorPrimaries out_primaries;
+  } cases[] = {
+    /* no gamma / no primaries */
+    {
+          FALSE, FALSE,
+          GST_VIDEO_TRANSFER_SRGB,
+          GST_VIDEO_COLOR_PRIMARIES_BT709,
+          GST_VIDEO_TRANSFER_SRGB,
+          GST_VIDEO_COLOR_PRIMARIES_BT709,
+        },
+    /* gamma only */
+    {
+          TRUE, FALSE,
+          GST_VIDEO_TRANSFER_SRGB,
+          GST_VIDEO_COLOR_PRIMARIES_BT709,
+          GST_VIDEO_TRANSFER_BT709,
+          GST_VIDEO_COLOR_PRIMARIES_BT709,
+        },
+    /* primaries conversion */
+    {
+          FALSE, TRUE,
+          GST_VIDEO_TRANSFER_SRGB,
+          GST_VIDEO_COLOR_PRIMARIES_BT709,
+          GST_VIDEO_TRANSFER_SRGB,
+          GST_VIDEO_COLOR_PRIMARIES_BT2020,
+        },
+    /* gamma + primaries conversion */
+    {
+          TRUE, TRUE,
+          GST_VIDEO_TRANSFER_SRGB,
+          GST_VIDEO_COLOR_PRIMARIES_BT709,
+          GST_VIDEO_TRANSFER_BT709,
+          GST_VIDEO_COLOR_PRIMARIES_BT2020,
+        },
+  };
+  guint i;
+
+  for (i = 0; i < G_N_ELEMENTS (cases); i++) {
+    GstVideoInfo in_info, out_info;
+    GstVideoFrame in_frame, out_frame;
+    GstBuffer *in_buf, *out_buf;
+    GstVideoConverter *convert;
+    GstStructure *config;
+    gfloat *data;
+    guint8 *result;
+    guint c;
+
+    fail_unless (gst_video_info_set_format (&in_info,
+            GST_VIDEO_FORMAT_ARGB_F32, 2, 1));
+    fail_unless (gst_video_info_set_format (&out_info,
+            GST_VIDEO_FORMAT_ARGB, 2, 1));
+
+    in_info.colorimetry.range = GST_VIDEO_COLOR_RANGE_0_1;
+    in_info.colorimetry.matrix = GST_VIDEO_COLOR_MATRIX_RGB;
+    in_info.colorimetry.transfer = cases[i].in_transfer;
+    in_info.colorimetry.primaries = cases[i].in_primaries;
+
+    out_info.colorimetry.range = GST_VIDEO_COLOR_RANGE_0_255;
+    out_info.colorimetry.matrix = GST_VIDEO_COLOR_MATRIX_RGB;
+    out_info.colorimetry.transfer = cases[i].out_transfer;
+    out_info.colorimetry.primaries = cases[i].out_primaries;
+
+    in_buf = gst_buffer_new_and_alloc (in_info.size);
+    out_buf = gst_buffer_new_and_alloc (out_info.size);
+
+    fail_unless (gst_video_frame_map (&in_frame, &in_info,
+            in_buf, GST_MAP_READWRITE));
+    fail_unless (gst_video_frame_map (&out_frame, &out_info,
+            out_buf, GST_MAP_READWRITE));
+
+    /* ARGB_F32: A, R, G, B */
+    data = GST_VIDEO_FRAME_PLANE_DATA (&in_frame, 0);
+
+    data[0] = 1.0f;
+    data[1] = -0.25f;
+    data[2] = -0.25f;
+    data[3] = -0.25f;
+
+    data[4] = 1.0f;
+    data[5] = 2.0f;
+    data[6] = 2.0f;
+    data[7] = 2.0f;
+
+    config = gst_structure_new ("options",
+        GST_VIDEO_CONVERTER_OPT_GAMMA_MODE,
+        GST_TYPE_VIDEO_GAMMA_MODE,
+        cases[i].gamma ? GST_VIDEO_GAMMA_MODE_REMAP :
+        GST_VIDEO_GAMMA_MODE_NONE,
+        GST_VIDEO_CONVERTER_OPT_PRIMARIES_MODE,
+        GST_TYPE_VIDEO_PRIMARIES_MODE,
+        cases[i].primaries ? GST_VIDEO_PRIMARIES_MODE_MERGE_ONLY :
+        GST_VIDEO_PRIMARIES_MODE_NONE, NULL);
+
+    convert = gst_video_converter_new (&in_info, &out_info, config);
+    fail_unless (convert);
+
+    gst_video_converter_frame (convert, &in_frame, &out_frame);
+
+    result = GST_VIDEO_FRAME_PLANE_DATA (&out_frame, 0);
+
+    /* lower clamp */
+    fail_unless_equals_int (result[0], 255);
+    for (c = 1; c < 4; c++) {
+      fail_unless (result[c] == 0,
+          "case %u, lower clamp comp %u, expected 0, got %u", i, c, result[c]);
+    }
+
+    /* upper clamp */
+    fail_unless_equals_int (result[4], 255);
+    for (c = 5; c < 8; c++) {
+      fail_unless (result[c] == 255,
+          "case %u, upper clamp comp %u, expected 255, got %u",
+          i, c - 4, result[c]);
+    }
+
+    gst_video_converter_free (convert);
+    gst_video_frame_unmap (&out_frame);
+    gst_video_frame_unmap (&in_frame);
+    gst_buffer_unref (out_buf);
+    gst_buffer_unref (in_buf);
   }
 }
 
@@ -2379,7 +2565,7 @@ make_pixels (gint depth, gint width, gint height)
       }
     }
     return pixels;
-  } else {
+  } else if (depth == 16) {
 #define TO16(a) (((a)<<8)|(a))
     guint16 *pixels = g_malloc (width * height * 8);
     for (i = 0; i < height; i++) {
@@ -2392,6 +2578,20 @@ make_pixels (gint depth, gint width, gint height)
       }
     }
 #undef TO16
+    return (guint8 *) pixels;
+  } else {
+    gfloat *pixels = g_malloc (width * height * 16);
+
+    for (i = 0; i < height; i++) {
+      for (j = 0; j < width; j++) {
+        pixels[(i * width + j) * 4 + 0] = ((color >> 24) & 0xff) / 255.0f;
+        pixels[(i * width + j) * 4 + 1] = ((color >> 16) & 0xff) / 255.0f;
+        pixels[(i * width + j) * 4 + 2] = ((color >> 8) & 0xff) / 255.0f;
+        pixels[(i * width + j) * 4 + 3] = (color & 0xff) / 255.0f;
+        color++;
+      }
+    }
+
     return (guint8 *) pixels;
   }
 }
@@ -2424,7 +2624,7 @@ compare_frame (const GstVideoFormatInfo * finfo, gint depth, guint8 * outpixels,
         }
       }
     }
-  } else {
+  } else if (depth == 16) {
     guint16 *in = (guint16 *) pixels;
     guint16 *out = (guint16 *) outpixels;
 
@@ -2435,7 +2635,29 @@ compare_frame (const GstVideoFormatInfo * finfo, gint depth, guint8 * outpixels,
         }
       }
     }
+  } else {
+    gfloat *in = (gfloat *) pixels;
+    gfloat *out = (gfloat *) outpixels;
+    gfloat epsilon = tolerance ? 0.001f : 0.0f;
+
+    for (i = 0; i < height; i++) {
+      for (j = 0; j < width; j++) {
+        for (k = 0; k < 4; k++) {
+          guint comp = (3 + k) % 4;
+          gfloat a, b;
+
+          if (finfo->depth[comp] == 0)
+            continue;
+
+          a = in[(HS (i, k) * width + WS (j, k)) * 4 + k];
+          b = out[(i * width + j) * 4 + k];
+
+          diff += ABS (a - b) > epsilon;
+        }
+      }
+    }
   }
+
   return diff;
 }
 
@@ -2521,7 +2743,7 @@ GST_START_TEST (test_video_pack_unpack2)
     fail_unless (fuinfo != NULL);
 
     depth = GST_VIDEO_FORMAT_INFO_BITS (fuinfo);
-    fail_unless (depth == 8 || depth == 16);
+    fail_unless (depth == 8 || depth == 16 || depth == 32);
 
     pixels = make_pixels (depth, WIDTH, HEIGHT);
     stride = WIDTH * (depth >> 1);
@@ -2594,7 +2816,7 @@ GST_START_TEST (test_video_pack_unpack2)
     if (diff != 0) {
       gst_util_dump_mem (outpixels, 128);
       gst_util_dump_mem (pixels, 128);
-      fail_if (diff != 0);
+      fail_if (diff != 0, "Format %s", finfo->name);
     }
     gst_video_frame_unmap (&frame);
     gst_buffer_unref (buffer);
@@ -4755,6 +4977,36 @@ GST_START_TEST (test_video_meta_transform_matrix_identity)
 
 GST_END_TEST;
 
+GST_START_TEST (test_video_meta_transform_matrix_nearly_affine)
+{
+  GstVideoMetaTransformMatrix trans;
+  GstVideoInfo in_info, out_info;
+  const GstVideoRectangle in_rect = { 0, 0, 100, 100 };
+  const GstVideoRectangle out_rect = { 0, 0, 100, 100 };
+  GstVideoRectangle rect = { 10, 10, 20, 20 };
+
+  gst_video_info_init (&in_info);
+  gst_video_info_set_format (&in_info, GST_VIDEO_FORMAT_I420, 100, 100);
+  gst_video_info_init (&out_info);
+  gst_video_info_set_format (&out_info, GST_VIDEO_FORMAT_I420, 100, 100);
+
+  gst_video_meta_transform_matrix_init (&trans, &in_info, &in_rect, &out_info,
+      &out_rect);
+  trans.matrix[0][1] = 1e-7f;
+  trans.matrix[1][0] = -1e-7f;
+  trans.matrix[2][0] = 1e-7f;
+  trans.matrix[2][1] = -1e-7f;
+  trans.matrix[2][2] = 1.0f + 1e-7f;
+
+  fail_unless (gst_video_meta_transform_matrix_rectangle (&trans, &rect));
+  fail_unless_equals_int (rect.x, 10);
+  fail_unless_equals_int (rect.y, 10);
+  fail_unless_equals_int (rect.w, 20);
+  fail_unless_equals_int (rect.h, 20);
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_video_meta_transform_matrix_translation)
 {
   GstVideoMetaTransformMatrix trans;
@@ -5184,6 +5436,221 @@ GST_START_TEST (test_video_meta_transform_matrix_rotation_45)
 
 GST_END_TEST;
 
+static void
+unpack_u8_pixel (const GstVideoFrame * frame, gint x, gint y, guint8 pixel[4])
+{
+  frame->info.finfo->unpack_func (frame->info.finfo,
+      GST_VIDEO_PACK_FLAG_NONE, pixel, frame->data, frame->info.stride,
+      x, y, 1);
+}
+
+GST_START_TEST (test_video_convert_border_color)
+{
+  const GstVideoFormat formats[] = {
+    GST_VIDEO_FORMAT_RGBA,
+    GST_VIDEO_FORMAT_AYUV,
+    GST_VIDEO_FORMAT_GRAY8,
+  };
+  const guint32 border_argb = 0xff4080c0;
+  GstVideoInfo src_info;
+  GstVideoFrame src_frame;
+  GstBuffer *src_buf;
+  guint i;
+
+  fail_unless (gst_video_info_set_format (&src_info,
+          GST_VIDEO_FORMAT_ARGB, 1, 1));
+
+  src_buf = gst_buffer_new_and_alloc (src_info.size);
+  fail_unless (gst_video_frame_map (&src_frame, &src_info,
+          src_buf, GST_MAP_READWRITE));
+
+  {
+    /* Fill source ARGB */
+    const guint8 argb[] = { 0xff, 0x40, 0x80, 0xc0 };
+    gpointer data[GST_VIDEO_MAX_PLANES] = { NULL, };
+    gint stride[GST_VIDEO_MAX_PLANES] = { 0, };
+
+    data[0] = GST_VIDEO_FRAME_PLANE_DATA (&src_frame, 0);
+    stride[0] = GST_VIDEO_FRAME_PLANE_STRIDE (&src_frame, 0);
+
+    src_info.finfo->pack_func (src_info.finfo, GST_VIDEO_PACK_FLAG_NONE,
+        (gpointer) argb, sizeof (argb), data, stride,
+        GST_VIDEO_CHROMA_SITE_UNKNOWN, 0, 1);
+  }
+
+  for (i = 0; i < G_N_ELEMENTS (formats); i++) {
+    GstVideoInfo ref_info, out_info;
+    GstVideoFrame ref_frame, out_frame;
+    GstBuffer *ref_buf, *out_buf;
+    GstVideoConverter *convert;
+    guint8 ref[4], border[4];
+    guint c;
+
+    /* 1st path, src -> test format to get the computed border color value */
+    fail_unless (gst_video_info_set_format (&ref_info, formats[i], 1, 1));
+
+    ref_buf = gst_buffer_new_and_alloc (ref_info.size);
+    fail_unless (gst_video_frame_map (&ref_frame, &ref_info,
+            ref_buf, GST_MAP_READWRITE));
+
+    convert = gst_video_converter_new (&src_info, &ref_info, NULL);
+    fail_unless (convert);
+
+    gst_video_converter_frame (convert, &src_frame, &ref_frame);
+    gst_video_converter_free (convert);
+
+    /* 2nd path, do actual conversion with border enabled */
+    fail_unless (gst_video_info_set_format (&out_info, formats[i], 3, 3));
+
+    out_buf = gst_buffer_new_and_alloc (out_info.size);
+    gst_buffer_memset (out_buf, 0, 0, out_info.size);
+
+    fail_unless (gst_video_frame_map (&out_frame, &out_info,
+            out_buf, GST_MAP_READWRITE));
+
+    convert = gst_video_converter_new (&src_info, &out_info,
+        gst_structure_new ("options",
+            GST_VIDEO_CONVERTER_OPT_DEST_X, G_TYPE_INT, 1,
+            GST_VIDEO_CONVERTER_OPT_DEST_Y, G_TYPE_INT, 1,
+            GST_VIDEO_CONVERTER_OPT_DEST_WIDTH, G_TYPE_INT, 1,
+            GST_VIDEO_CONVERTER_OPT_DEST_HEIGHT, G_TYPE_INT, 1,
+            GST_VIDEO_CONVERTER_OPT_BORDER_ARGB, G_TYPE_UINT,
+            border_argb, NULL));
+    fail_unless (convert);
+
+    gst_video_converter_frame (convert, &src_frame, &out_frame);
+    gst_video_converter_free (convert);
+
+    /* compare color values between reference (converted via normal conversion
+     * path) and produced borders */
+    unpack_u8_pixel (&ref_frame, 0, 0, ref);
+    unpack_u8_pixel (&out_frame, 0, 1, border);
+    for (c = 0; c < 4; c++) {
+      fail_unless (ref[c] == border[c], "%s comp %u, ref %u, border %u",
+          gst_video_format_to_string (formats[i]), c, ref[c], border[c]);
+    }
+
+    gst_video_frame_unmap (&out_frame);
+    gst_video_frame_unmap (&ref_frame);
+    gst_buffer_unref (out_buf);
+    gst_buffer_unref (ref_buf);
+  }
+
+  gst_video_frame_unmap (&src_frame);
+  gst_buffer_unref (src_buf);
+}
+
+GST_END_TEST;
+
+static void
+unpack_float_pixel (const GstVideoFrame * frame, gint x, gint y,
+    gfloat pixel[4])
+{
+  frame->info.finfo->unpack_func (frame->info.finfo,
+      GST_VIDEO_PACK_FLAG_NONE, pixel, frame->data, frame->info.stride,
+      x, y, 1);
+}
+
+GST_START_TEST (test_video_convert_float_border_color)
+{
+  const GstVideoFormat formats[] = {
+    GST_VIDEO_FORMAT_RGBA_F32LE,
+    GST_VIDEO_FORMAT_AYUV_F32,
+    GST_VIDEO_FORMAT_GRAY_F32LE,
+  };
+  const guint32 border_argb = 0xff4080c0;
+  GstVideoInfo src_info;
+  GstVideoFrame src_frame;
+  GstBuffer *src_buf;
+  guint i;
+
+  fail_unless (gst_video_info_set_format (&src_info,
+          GST_VIDEO_FORMAT_ARGB, 1, 1));
+
+  src_buf = gst_buffer_new_and_alloc (src_info.size);
+  fail_unless (gst_video_frame_map (&src_frame, &src_info,
+          src_buf, GST_MAP_READWRITE));
+
+  {
+    /* Fill source ARGB */
+    const guint8 argb[] = { 0xff, 0x40, 0x80, 0xc0 };
+    gpointer data[GST_VIDEO_MAX_PLANES] = { NULL, };
+    gint stride[GST_VIDEO_MAX_PLANES] = { 0, };
+
+    data[0] = GST_VIDEO_FRAME_PLANE_DATA (&src_frame, 0);
+    stride[0] = GST_VIDEO_FRAME_PLANE_STRIDE (&src_frame, 0);
+
+    src_info.finfo->pack_func (src_info.finfo, GST_VIDEO_PACK_FLAG_NONE,
+        (gpointer) argb, sizeof (argb), data, stride,
+        GST_VIDEO_CHROMA_SITE_UNKNOWN, 0, 1);
+  }
+
+  for (i = 0; i < G_N_ELEMENTS (formats); i++) {
+    GstVideoInfo ref_info, out_info;
+    GstVideoFrame ref_frame, out_frame;
+    GstBuffer *ref_buf, *out_buf;
+    GstVideoConverter *convert;
+    gfloat ref[4], border[4];
+    guint c;
+
+    /* 1st path, src -> test format to get the computed border color value */
+    fail_unless (gst_video_info_set_format (&ref_info, formats[i], 1, 1));
+
+    ref_buf = gst_buffer_new_and_alloc (ref_info.size);
+    fail_unless (gst_video_frame_map (&ref_frame, &ref_info,
+            ref_buf, GST_MAP_READWRITE));
+
+    convert = gst_video_converter_new (&src_info, &ref_info, NULL);
+    fail_unless (convert);
+
+    gst_video_converter_frame (convert, &src_frame, &ref_frame);
+    gst_video_converter_free (convert);
+
+    /* 2nd path, do actual conversion with border enabled */
+    fail_unless (gst_video_info_set_format (&out_info, formats[i], 3, 3));
+
+    out_buf = gst_buffer_new_and_alloc (out_info.size);
+    gst_buffer_memset (out_buf, 0, 0, out_info.size);
+
+    fail_unless (gst_video_frame_map (&out_frame, &out_info,
+            out_buf, GST_MAP_READWRITE));
+
+    convert = gst_video_converter_new (&src_info, &out_info,
+        gst_structure_new ("options",
+            GST_VIDEO_CONVERTER_OPT_DEST_X, G_TYPE_INT, 1,
+            GST_VIDEO_CONVERTER_OPT_DEST_Y, G_TYPE_INT, 1,
+            GST_VIDEO_CONVERTER_OPT_DEST_WIDTH, G_TYPE_INT, 1,
+            GST_VIDEO_CONVERTER_OPT_DEST_HEIGHT, G_TYPE_INT, 1,
+            GST_VIDEO_CONVERTER_OPT_BORDER_ARGB, G_TYPE_UINT,
+            border_argb, NULL));
+    fail_unless (convert);
+
+    gst_video_converter_frame (convert, &src_frame, &out_frame);
+    gst_video_converter_free (convert);
+
+    /* Compare color values between reference (converted via normal conversion
+     * path) and produced borders. */
+    unpack_float_pixel (&ref_frame, 0, 0, ref);
+    unpack_float_pixel (&out_frame, 0, 1, border);
+
+    for (c = 0; c < 4; c++) {
+      fail_unless (ABS (ref[c] - border[c]) < 0.0001f,
+          "%s comp %u, ref %f, border %f",
+          gst_video_format_to_string (formats[i]), c, ref[c], border[c]);
+    }
+
+    gst_video_frame_unmap (&out_frame);
+    gst_video_frame_unmap (&ref_frame);
+    gst_buffer_unref (out_buf);
+    gst_buffer_unref (ref_buf);
+  }
+
+  gst_video_frame_unmap (&src_frame);
+  gst_buffer_unref (src_buf);
+}
+
+GST_END_TEST;
+
 static Suite *
 video_suite (void)
 {
@@ -5201,6 +5668,8 @@ video_suite (void)
   tcase_add_test (tc_chain, test_video_formats_pack_unpack);
   tcase_add_test (tc_chain, test_video_formats_float);
   tcase_add_test (tc_chain, test_video_convert_rgba_float_lossless);
+  tcase_add_test (tc_chain, test_video_convert_rgba_float);
+  tcase_add_test (tc_chain, test_video_convert_float_to_integer_clamp);
   tcase_add_test (tc_chain, test_guess_framerate);
   tcase_add_test (tc_chain, test_dar_calc);
   tcase_add_test (tc_chain, test_parse_caps_rgb);
@@ -5251,6 +5720,7 @@ video_suite (void)
   tcase_add_test (tc_chain, test_video_convert_with_config_update);
   tcase_add_test (tc_chain, test_dma_drm_big_engian);
   tcase_add_test (tc_chain, test_video_meta_transform_matrix_identity);
+  tcase_add_test (tc_chain, test_video_meta_transform_matrix_nearly_affine);
   tcase_add_test (tc_chain, test_video_meta_transform_matrix_translation);
   tcase_add_test (tc_chain, test_video_meta_transform_matrix_scaling);
   tcase_add_test (tc_chain, test_video_meta_transform_matrix_clamping);
@@ -5262,6 +5732,8 @@ video_suite (void)
   tcase_add_test (tc_chain, test_video_meta_transform_matrix_flip_horizontal);
   tcase_add_test (tc_chain, test_video_meta_transform_matrix_flip_vertical);
   tcase_add_test (tc_chain, test_video_meta_transform_matrix_rotation_45);
+  tcase_add_test (tc_chain, test_video_convert_border_color);
+  tcase_add_test (tc_chain, test_video_convert_float_border_color);
 
   return s;
 }

@@ -153,7 +153,6 @@ union _GstVulkanEncoderParametersFeedback
 
 struct _GstVulkanEncoderQualityPoperties
 {
-  gint32 quality_level;
   union
   {
     VkVideoEncodeH264QualityLevelPropertiesKHR h264;
@@ -175,12 +174,13 @@ void                    gst_vulkan_encoder_set_callbacks        (GstVulkanEncode
                                                                  GDestroyNotify notify);
 GST_VULKAN_API
 void                    gst_vulkan_encoder_set_rc_mode          (GstVulkanEncoder * self,
+                                                                 const GstVulkanVideoCapabilities * vk_caps,
                                                                  VkVideoEncodeRateControlModeFlagBitsKHR rc_mode);
 
 GST_VULKAN_API
 gboolean                gst_vulkan_encoder_start                (GstVulkanEncoder * self,
                                                                  GstVulkanVideoProfile * profile,
-                                                                 GstVulkanEncoderQualityProperties * codec_quality_props,
+                                                                 gconstpointer session_create_pnext,
                                                                  GError ** error);
 GST_VULKAN_API
 gboolean                gst_vulkan_encoder_stop                 (GstVulkanEncoder * self);
@@ -214,9 +214,16 @@ gboolean                gst_vulkan_encoder_is_started           (GstVulkanEncode
 GST_VULKAN_API
 GstCaps *               gst_vulkan_encoder_profile_caps         (GstVulkanEncoder * self);
 GST_VULKAN_API
-gint32                  gst_vulkan_encoder_quality_level        (GstVulkanEncoder * self);
+gboolean                gst_vulkan_encoder_set_quality_level    (GstVulkanEncoder * self,
+                                                                 guint32 quality,
+                                                                 const GstVulkanVideoProfile * vk_profile,
+                                                                 const GstVulkanVideoCapabilities * vk_caps,
+                                                                 GstVulkanEncoderQualityProperties * out_quality_props,
+                                                                 GError ** error);
 GST_VULKAN_API
-gint32                  gst_vulkan_encoder_rc_mode              (GstVulkanEncoder * self);
+guint32                 gst_vulkan_encoder_quality_level        (GstVulkanEncoder * self);
+GST_VULKAN_API
+guint32                 gst_vulkan_encoder_rc_mode              (GstVulkanEncoder * self);
 
 GST_VULKAN_API
 gboolean                gst_vulkan_encoder_picture_init         (GstVulkanEncoderPicture * pic,

@@ -653,11 +653,12 @@ GST_START_TEST (test_message_state_changed_children)
   GST_DEBUG ("refcount <= 4 now");
 
   /* each object is referenced by a message;
+   * the base src pad task holds a strong reference to the source
    * base_src is blocked in the push and has an extra refcount.
    * base_sink_chain has taken a refcount on the sink, and is blocked on
    * preroll
    * The stream-status messages holds 2 more refs to the element */
-  ASSERT_OBJECT_REFCOUNT (src, "src", 4);
+  ASSERT_OBJECT_REFCOUNT (src, "src", 5);
   /* refcount can be 4 if the bin is still processing the async_done message of
    * the sink. */
   ASSERT_OBJECT_REFCOUNT_BETWEEN (sink, "sink", 2, 4);
@@ -671,7 +672,8 @@ GST_START_TEST (test_message_state_changed_children)
   fail_if ((gst_bus_pop (bus)) != NULL);
 
   ASSERT_OBJECT_REFCOUNT_BETWEEN (bus, "bus", 2, 3);
-  ASSERT_OBJECT_REFCOUNT (src, "src", 1);
+  /* The base src pad task still holds a strong reference to the source */
+  ASSERT_OBJECT_REFCOUNT (src, "src", 2);
   ASSERT_OBJECT_REFCOUNT_BETWEEN (sink, "sink", 2, 3);
   ASSERT_OBJECT_REFCOUNT (pipeline, "pipeline", 1);
 
@@ -699,7 +701,7 @@ GST_START_TEST (test_message_state_changed_children)
 
   ASSERT_OBJECT_REFCOUNT (bus, "bus", 2);
   /* src might have an extra reference if it's still pushing */
-  ASSERT_OBJECT_REFCOUNT_BETWEEN (src, "src", 1, 2);
+  ASSERT_OBJECT_REFCOUNT_BETWEEN (src, "src", 2, 3);
   /* sink might have an extra reference if it's still blocked on preroll */
   ASSERT_OBJECT_REFCOUNT_BETWEEN (sink, "sink", 1, 3);
   ASSERT_OBJECT_REFCOUNT (pipeline, "pipeline", 1);
@@ -710,8 +712,9 @@ GST_START_TEST (test_message_state_changed_children)
   fail_unless (ret == GST_STATE_CHANGE_SUCCESS);
 
   /* each object is referenced by two messages, the source also has the
-   * stream-status message referencing it */
-  ASSERT_OBJECT_REFCOUNT (src, "src", 4);
+   * stream-status message referencing it, and the source pad task still
+   * holds a strong reference */
+  ASSERT_OBJECT_REFCOUNT (src, "src", 5);
   ASSERT_OBJECT_REFCOUNT_BETWEEN (sink, "sink", 3, 4);
   ASSERT_OBJECT_REFCOUNT (pipeline, "pipeline", 3);
 
@@ -1716,11 +1719,21 @@ GST_START_TEST (test_duration_is_max)
   /* irks, duration is reset on basesrc */
   state_res = gst_element_set_state (bin, GST_STATE_PAUSED);
   fail_unless (state_res != GST_STATE_CHANGE_FAILURE, NULL);
+  state_res =
+      gst_element_get_state (GST_ELEMENT (bin), NULL, NULL,
+      GST_CLOCK_TIME_NONE);
+  fail_unless (state_res != GST_STATE_CHANGE_FAILURE, NULL);
 
   /* set durations on src */
+  GST_OBJECT_LOCK (src[0]);
   GST_BASE_SRC (src[0])->segment.duration = 1000;
+  GST_OBJECT_UNLOCK (src[0]);
+  GST_OBJECT_LOCK (src[1]);
   GST_BASE_SRC (src[1])->segment.duration = 3000;
+  GST_OBJECT_UNLOCK (src[1]);
+  GST_OBJECT_LOCK (src[2]);
   GST_BASE_SRC (src[2])->segment.duration = 2000;
+  GST_OBJECT_UNLOCK (src[2]);
 
   /* set to playing */
   state_res = gst_element_set_state (bin, GST_STATE_PLAYING);
@@ -1778,11 +1791,21 @@ GST_START_TEST (test_duration_unknown_overrides)
   /* irks, duration is reset on basesrc */
   state_res = gst_element_set_state (bin, GST_STATE_PAUSED);
   fail_unless (state_res != GST_STATE_CHANGE_FAILURE, NULL);
+  state_res =
+      gst_element_get_state (GST_ELEMENT (bin), NULL, NULL,
+      GST_CLOCK_TIME_NONE);
+  fail_unless (state_res != GST_STATE_CHANGE_FAILURE, NULL);
 
   /* set durations on src */
+  GST_OBJECT_LOCK (src[0]);
   GST_BASE_SRC (src[0])->segment.duration = GST_CLOCK_TIME_NONE;
+  GST_OBJECT_UNLOCK (src[0]);
+  GST_OBJECT_LOCK (src[1]);
   GST_BASE_SRC (src[1])->segment.duration = 3000;
+  GST_OBJECT_UNLOCK (src[1]);
+  GST_OBJECT_LOCK (src[2]);
   GST_BASE_SRC (src[2])->segment.duration = 2000;
+  GST_OBJECT_UNLOCK (src[2]);
 
   /* set to playing */
   state_res = gst_element_set_state (bin, GST_STATE_PLAYING);

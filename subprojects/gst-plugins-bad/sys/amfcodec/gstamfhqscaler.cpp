@@ -73,6 +73,15 @@ enum
 #define DEFAULT_ADD_BORDERS         TRUE
 #define DEFAULT_BORDER_COLOR        0x00000000  /* opaque black, packed AMFColor */
 
+#define DOC_CAPS_COMM \
+    "format = (string) { NV12, P010_10LE, BGRA, RGBA }, " \
+    "width = (int) [ 128, 8192 ], height = (int) [ 128, 4096 ]"
+
+#define DOC_CAPS \
+    "video/x-raw(memory:D3D12Memory), " DOC_CAPS_COMM "; " \
+    "video/x-raw(memory:D3D11Memory), " DOC_CAPS_COMM "; " \
+    "video/x-raw, " DOC_CAPS_COMM
+
 typedef struct _GstAmfHQScaler GstAmfHQScaler;
 typedef struct _GstAmfHQScalerClass GstAmfHQScalerClass;
 
@@ -147,6 +156,8 @@ gst_amf_hq_scaler_class_init (GstAmfHQScalerClass * klass, gpointer data)
   GstBaseTransformClass *trans_class = GST_BASE_TRANSFORM_CLASS (klass);
   GstAmfBaseFilterClass *base_class = GST_AMF_BASE_FILTER_CLASS (klass);
   GstAmfHQScalerClassData *cdata = (GstAmfHQScalerClassData *) data;
+  GstPadTemplate *pad_templ;
+  GstCaps *doc_caps;
 
   gobject_class->set_property = gst_amf_hq_scaler_set_property;
   gobject_class->get_property = gst_amf_hq_scaler_get_property;
@@ -180,12 +191,19 @@ gst_amf_hq_scaler_class_init (GstAmfHQScalerClass * klass, gpointer data)
           (GParamFlags) (G_PARAM_READWRITE | GST_PARAM_MUTABLE_READY |
               G_PARAM_STATIC_STRINGS)));
 
-  gst_element_class_add_pad_template (element_class,
-      gst_pad_template_new ("sink", GST_PAD_SINK, GST_PAD_ALWAYS,
-          cdata->sink_caps));
-  gst_element_class_add_pad_template (element_class,
-      gst_pad_template_new ("src", GST_PAD_SRC, GST_PAD_ALWAYS,
-          cdata->src_caps));
+  pad_templ = gst_pad_template_new ("sink", GST_PAD_SINK, GST_PAD_ALWAYS,
+      cdata->sink_caps);
+  doc_caps = gst_caps_from_string (DOC_CAPS);
+  gst_pad_template_set_documentation_caps (pad_templ, doc_caps);
+  gst_caps_unref (doc_caps);
+  gst_element_class_add_pad_template (element_class, pad_templ);
+
+  pad_templ = gst_pad_template_new ("src", GST_PAD_SRC, GST_PAD_ALWAYS,
+      cdata->src_caps);
+  doc_caps = gst_caps_from_string (DOC_CAPS);
+  gst_pad_template_set_documentation_caps (pad_templ, doc_caps);
+  gst_caps_unref (doc_caps);
+  gst_element_class_add_pad_template (element_class, pad_templ);
 
   gst_element_class_set_static_metadata (element_class,
       "AMD AMF High-Quality Video Scaler",
@@ -298,6 +316,10 @@ gst_amf_hq_scaler_is_supported_caps_features (const GstCapsFeatures * features)
 #ifdef G_OS_WIN32
     if (!g_strcmp0 (feature, GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY))
       continue;
+#ifdef HAVE_GST_D3D12
+    if (!g_strcmp0 (feature, GST_CAPS_FEATURE_MEMORY_D3D12_MEMORY))
+      continue;
+#endif
 #endif
 
     return FALSE;
@@ -423,6 +445,14 @@ gst_amf_hq_scaler_transform_size_info (GstBaseTransform * trans,
           1, G_MAXINT, G_MAXINT, 1, NULL);
     }
 #ifdef G_OS_WIN32
+#ifdef HAVE_GST_D3D12
+    if (feat
+        && gst_caps_features_contains (feat,
+            GST_CAPS_FEATURE_MEMORY_D3D12_MEMORY)) {
+      gst_caps_append_structure_full (res, st,
+          gst_caps_features_new (GST_CAPS_FEATURE_MEMORY_D3D12_MEMORY, NULL));
+    } else
+#endif
     if (feat
         && gst_caps_features_contains (feat,
             GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY)) {
@@ -449,6 +479,19 @@ gst_amf_hq_scaler_transform_caps (GstBaseTransform * trans,
   /* The HQ scaler does not change pixel format, only width/height,
    * so we keep the format/colorimetry untouched. */
   tmp = gst_amf_hq_scaler_transform_size_info (trans, caps, direction);
+
+#if defined(G_OS_WIN32) && defined(HAVE_GST_D3D12)
+  {
+    /* Overrides (doesn't chain to) GstAmfBaseFilter's transform_caps, so
+     * its api-based filtering has to be reapplied here too. */
+    GstAmfBaseFilter *self = GST_AMF_BASE_FILTER (trans);
+    GstCaps *filtered = gst_amf_filter_caps_by_api (tmp,
+        gst_amf_base_filter_get_configured_api (self));
+
+    gst_caps_unref (tmp);
+    tmp = filtered;
+  }
+#endif
 
   if (filter) {
     result = gst_caps_intersect_full (filter, tmp, GST_CAPS_INTERSECT_FIRST);
@@ -992,13 +1035,17 @@ gst_amf_hq_scaler_configure_component (GstAmfBaseFilter * filter,
   algorithm = gst_amf_hq_scaler_resolve_algorithm (self, in_info);
   from_srgb = gst_amf_hq_scaler_from_srgb_from_info (in_info);
 
-  if (gst_amf_base_filter_get_device (filter)) {
-    result = comp->SetProperty (AMF_HQ_SCALER_ENGINE_TYPE,
-#ifdef G_OS_WIN32
-        (amf_int64) amf::AMF_MEMORY_DX11);
-#else
-        (amf_int64) amf::AMF_MEMORY_VULKAN);
+  {
+    /* amfhqscaler is Windows-only for now. */
+    amf::AMF_MEMORY_TYPE engine_type = amf::AMF_MEMORY_DX11;
+
+#ifdef HAVE_GST_D3D12
+    if (gst_amf_base_filter_get_api (filter) == GST_AMF_API_D3D12)
+      engine_type = amf::AMF_MEMORY_DX12;
 #endif
+
+    result = comp->SetProperty (AMF_HQ_SCALER_ENGINE_TYPE,
+        (amf_int64) engine_type);
     if (result != AMF_OK)
       GST_WARNING_OBJECT (self, "Failed to set HQ scaler engine type");
   }
@@ -1130,6 +1177,16 @@ gst_amf_hq_scaler_build_template_caps (AMFComponent * comp, gboolean is_input)
       gst_caps_set_features (d3d11_caps, j,
           gst_caps_features_new (GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY, NULL));
     }
+#ifdef HAVE_GST_D3D12
+    if (AMFContext2Ptr (comp->GetContext ())->GetDX12Device ()) {
+      GstCaps *d3d12_caps = gst_caps_copy (caps);
+      for (guint j = 0; j < gst_caps_get_size (d3d12_caps); j++) {
+        gst_caps_set_features (d3d12_caps, j,
+            gst_caps_features_new (GST_CAPS_FEATURE_MEMORY_D3D12_MEMORY, NULL));
+      }
+      gst_caps_append (d3d11_caps, d3d12_caps);
+    }
+#endif
     gst_caps_append (d3d11_caps, caps);
     return d3d11_caps;
   }

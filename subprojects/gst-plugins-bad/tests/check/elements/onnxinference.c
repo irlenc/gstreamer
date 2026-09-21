@@ -46,13 +46,23 @@ static void assert_model_fails_to_start (const gchar * model_name);
       __FILE__, __LINE__)
 
 static GstHarness *
-harness_new_with_model (const gchar * model_path)
+harness_new_with_model (const gchar * model_path, gboolean with_convert)
 {
-  gchar *launch = g_strdup_printf ("onnxinference model-file=%s", model_path);
-  GstHarness *h = gst_harness_new_parse (launch);
+  gchar *path = g_strdup (model_path);
+  gchar *launch;
+  GstHarness *h;
+
+#ifdef G_OS_WIN32
+  g_strdelimit (path, "\\", '/');
+#endif
+
+  launch = g_strdup_printf ("%sonnxinference model-file=%s", with_convert ?
+      "videoconvert ! " : "", path);
+  h = gst_harness_new_parse (launch);
 
   gst_harness_play (h);
   g_free (launch);
+  g_free (path);
 
   return h;
 }
@@ -82,7 +92,7 @@ GST_START_TEST (test_normalization_variants)
     gchar *tmp_model = setup_model_with_ranges (GST_ONNX_TEST_DATA_PATH,
         "onnxinference", "flatten_float32in_float32out.onnx",
         tests[i].ranges);
-    GstHarness *h = harness_new_with_model (tmp_model);
+    GstHarness *h = harness_new_with_model (tmp_model, TRUE);
     GstBuffer *in = create_solid_color_buffer (GST_VIDEO_FORMAT_RGB,
         TEST_WIDTH, TEST_HEIGHT, 11, 22, 33, 55);
     GstBuffer *out;
@@ -121,7 +131,7 @@ GST_START_TEST (test_output_int32)
   gchar *tmp_model = setup_model_with_ranges (GST_ONNX_TEST_DATA_PATH,
       "onnxinference", "int32out.onnx",
       "0.0,255.0;0.0,255.0;0.0,255.0");
-  GstHarness *h = harness_new_with_model (tmp_model);
+  GstHarness *h = harness_new_with_model (tmp_model, TRUE);
   GstBuffer *in = create_solid_color_buffer (GST_VIDEO_FORMAT_RGB,
       TEST_WIDTH, TEST_HEIGHT, 11, 22, 33, 55);
   GstBuffer *out;
@@ -175,7 +185,7 @@ GST_START_TEST (test_output_uint8_rejected)
 
 GST_END_TEST;
 
-/* Test that a model with a float64 output does not fail to reach PAUSED state. */
+/* Test that a model with a float64 output fails to reach PAUSED state. */
 GST_START_TEST (test_output_float64_rejected)
 {
   gchar *model = g_build_filename (GST_ONNX_TEST_DATA_PATH,
@@ -183,7 +193,7 @@ GST_START_TEST (test_output_float64_rejected)
   GstElement *e = gst_element_factory_make ("onnxinference", NULL);
 
   g_object_set (e, "model-file", model, NULL);
-  fail_if (gst_element_set_state (e, GST_STATE_PAUSED)
+  fail_unless (gst_element_set_state (e, GST_STATE_PAUSED)
       == GST_STATE_CHANGE_FAILURE);
 
   gst_element_set_state (e, GST_STATE_NULL);
@@ -199,7 +209,7 @@ GST_START_TEST (test_dynamic_batch)
   gchar *tmp_model = setup_model_with_ranges (GST_ONNX_TEST_DATA_PATH,
       "onnxinference", "dynamic_batch.onnx",
       "0.0,255.0;0.0,255.0;0.0,255.0");
-  GstHarness *h = harness_new_with_model (tmp_model);
+  GstHarness *h = harness_new_with_model (tmp_model, TRUE);
   GstBuffer *in = create_solid_color_buffer (GST_VIDEO_FORMAT_RGB,
       TEST_WIDTH, TEST_HEIGHT, 11, 22, 33, 55);
   GstBuffer *out;
@@ -234,7 +244,7 @@ GST_START_TEST (test_3d_input)
   gchar *tmp_model = setup_model_with_ranges (GST_ONNX_TEST_DATA_PATH,
       "onnxinference", "flatten_3d_float32.onnx",
       "0.0,255.0;0.0,255.0;0.0,255.0");
-  GstHarness *h = harness_new_with_model (tmp_model);
+  GstHarness *h = harness_new_with_model (tmp_model, TRUE);
   GstBuffer *in = create_solid_color_buffer (GST_VIDEO_FORMAT_RGBP,
       TEST_WIDTH, TEST_HEIGHT, 11, 22, 33, 55);
   GstBuffer *out;
@@ -273,7 +283,7 @@ GST_START_TEST (test_multi_output_tensor_id_and_dims_order)
   gchar *tmp_model = setup_model_with_ranges (GST_ONNX_TEST_DATA_PATH,
       "onnxinference", "multi_output.onnx",
       "0.0,255.0;0.0,255.0;0.0,255.0");
-  GstHarness *h = harness_new_with_model (tmp_model);
+  GstHarness *h = harness_new_with_model (tmp_model, TRUE);
   GstBuffer *in = create_solid_color_buffer (GST_VIDEO_FORMAT_RGB,
       TEST_WIDTH, TEST_HEIGHT, 11, 22, 33, 55);
   GstBuffer *out;
@@ -355,7 +365,7 @@ GST_START_TEST (test_planar_chw_input)
   gchar *tmp_model = setup_model_with_ranges (GST_ONNX_TEST_DATA_PATH,
       "onnxinference", "planar_chw.onnx",
       "0.0,255.0;0.0,255.0;0.0,255.0");
-  GstHarness *h = harness_new_with_model (tmp_model);
+  GstHarness *h = harness_new_with_model (tmp_model, TRUE);
   GstBuffer *in = create_solid_color_buffer (GST_VIDEO_FORMAT_RGBP,
       TEST_WIDTH, TEST_HEIGHT, 11, 22, 33, 55);
   GstBuffer *out;
@@ -397,7 +407,7 @@ GST_START_TEST (test_gray8_input)
   gchar *tmp_model = setup_model_with_ranges (GST_ONNX_TEST_DATA_PATH,
       "onnxinference", "flatten_gray.onnx",
       "0.0,255.0");
-  GstHarness *h = harness_new_with_model (tmp_model);
+  GstHarness *h = harness_new_with_model (tmp_model, TRUE);
   GstBuffer *in = create_solid_gray_buffer (GST_VIDEO_FORMAT_GRAY8,
       NULL, TEST_WIDTH, TEST_HEIGHT, 42);
   GstBuffer *out;
@@ -483,7 +493,7 @@ GST_START_TEST (test_timestamp_and_flags_propagation)
   gchar *tmp_model = setup_model_with_ranges (GST_ONNX_TEST_DATA_PATH,
       "onnxinference", "flatten_float32in_float32out.onnx",
       "0.0,255.0;0.0,255.0;0.0,255.0");
-  GstHarness *h = harness_new_with_model (tmp_model);
+  GstHarness *h = harness_new_with_model (tmp_model, TRUE);
   GstBuffer *in = create_solid_color_buffer (GST_VIDEO_FORMAT_RGB,
       TEST_WIDTH, TEST_HEIGHT, 11, 22, 33, 55);
   GstBuffer *out;
@@ -517,7 +527,7 @@ GST_START_TEST (test_transform_caps_and_accept_caps)
   gchar *tmp_model = setup_model_with_ranges (GST_ONNX_TEST_DATA_PATH,
       "onnxinference", "flatten_uint8in_float32out.onnx",
       "0.0,255.0;0.0,255.0;0.0,255.0");
-  GstHarness *h = harness_new_with_model (tmp_model);
+  GstHarness *h = harness_new_with_model (tmp_model, FALSE);
   GstPad *sinkpad = gst_element_get_static_pad (h->element, "sink");
   GstCaps *filter = gst_caps_from_string ("video/x-raw,format=RGB");
   GstCaps *caps = gst_pad_query_caps (sinkpad, filter);
@@ -553,7 +563,7 @@ GST_START_TEST (test_accept_caps_dimension_mismatch)
   gchar *tmp_model = setup_model_with_ranges (GST_ONNX_TEST_DATA_PATH,
       "onnxinference", "flatten_uint8in_float32out.onnx",
       "0.0,255.0;0.0,255.0;0.0,255.0");
-  GstHarness *h = harness_new_with_model (tmp_model);
+  GstHarness *h = harness_new_with_model (tmp_model, FALSE);
   GstPad *sinkpad = gst_element_get_static_pad (h->element, "sink");
   GstCaps *caps;
 

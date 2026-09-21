@@ -121,7 +121,7 @@ static GstStaticPadTemplate gst_yolo_tensor_decoder_src_template =
 GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS ("video/x-raw"));
+    GST_STATIC_CAPS ("video/x-raw(ANY)"));
 
 /* *INDENT-OFF* */
 static GstStaticPadTemplate gst_yolo_tensor_decoder_sink_template =
@@ -129,7 +129,7 @@ GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK,
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS (
-      "video/x-raw,"
+      "video/x-raw(ANY),"
         "tensors=(structure)["
           "tensorgroups,"
             "yolo-v8-out=(/uniquelist){"
@@ -602,7 +602,8 @@ gst_yolo_tensor_decoder_decode_f32 (GstYoloTensorDecoder * self,
   GstMapInfo map_info_detections;
   gfloat iou;
   gboolean rv, keep;
-  gsize offset, x_offset, y_offset, w_offset, h_offset, offsets[5];
+  gsize offset, x_offset, y_offset, w_offset, h_offset;
+  gsize offsets[5] = { 0 };
   BBox bb;
   ConfidenceRange c_range;
   gsize max_class_offset = 0, class_index;

@@ -1,8 +1,5 @@
-/*
- * GStreamer gstreamer-ml
- * Copyright (C) 2021 Collabora Ltd
- *
- * gstml.h
+/* GStreamer
+ * Copyright (C) 2026 Seungha Yang <seungha@centricular.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -19,23 +16,19 @@
  * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
  * Boston, MA 02110-1301, USA.
  */
-#ifndef __GST_ML_H__
-#define __GST_ML_H__
 
+#pragma once
 
-/**
- * GstMlInputImageFormat:
- *
- * @GST_ML_INPUT_IMAGE_FORMAT_HWC Height Width Channel (a.k.a. interleaved) format
- * @GST_ML_INPUT_IMAGE_FORMAT_CHW Channel Height Width  (a.k.a. planar) format
- *
- * Since: 1.20
- */
-typedef enum {
-  GST_ML_INPUT_IMAGE_FORMAT_HWC,
-  GST_ML_INPUT_IMAGE_FORMAT_CHW,
-} GstMlInputImageFormat;
+#include "gstonnximporter.h"
+#include <gst/hip/gsthip.h>
 
+G_BEGIN_DECLS
 
+#define GST_TYPE_ONNX_IMPORTER_HIP (gst_onnx_importer_hip_get_type ())
+G_DECLARE_FINAL_TYPE (GstOnnxImporterHip,
+    gst_onnx_importer_hip, GST, ONNX_IMPORTER_HIP, GstOnnxImporter);
 
-#endif
+GstOnnxImporter * gst_onnx_importer_hip_new (const OrtApi * api,
+                                             GstHipDevice * device);
+
+G_END_DECLS

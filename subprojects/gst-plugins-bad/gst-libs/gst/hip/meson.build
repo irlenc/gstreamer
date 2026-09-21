@@ -2,10 +2,13 @@ hip_sources = [
   'gsthip-enums.cpp',
   'gsthip-interop.cpp',
   'gsthipbufferpool.cpp',
+  'gsthipbufferpool-host.cpp',
   'gsthipdevice.cpp',
   'gsthipevent.cpp',
+  'gsthipformat.cpp',
   'gsthiploader.cpp',
   'gsthipmemory.cpp',
+  'gsthipmemory-host.cpp',
   'gsthiprtc.cpp',
   'gsthipstream.cpp',
   'gsthiputils.cpp',
@@ -17,10 +20,12 @@ hip_headers = [
   'gsthip-interop.h',
   'gsthip.h',
   'gsthipbufferpool.h',
+  'gsthipbufferpool-host.h',
   'gsthipdevice.h',
   'gsthipevent.h',
   'gsthiploader.h',
   'gsthipmemory.h',
+  'gsthipmemory-host.h',
   'gsthiprtc.h',
   'gsthipstream.h',
   'gsthiputils.h',
@@ -79,7 +84,7 @@ gsthip = library('gsthip-' + api_version,
   c_args : gst_plugins_bad_args + extra_args,
   cpp_args: gst_plugins_bad_args + extra_args,
   include_directories : [configinc, libsinc, hipstub_incdir],
-  dependencies : [gst_dep, gstbase_dep, gstvideo_dep, gmodule_dep] + extra_deps,
+  dependencies : [gst_dep, gstbase_dep, gstvideo_dep, gstallocators_dep, gmodule_dep] + extra_deps,
   version : libversion,
   soversion : soversion,
   install : true,
@@ -104,7 +109,7 @@ if build_gir
     'includes' : gir_includes,
     'install' : true,
     'extra_args' : gir_init_section + ['-DGST_USE_UNSTABLE_API', '-I' + stub_path],
-    'dependencies' : [gst_dep, gstbase_dep, gstvideo_dep],
+    'dependencies' : [gst_dep, gstbase_dep, gstvideo_dep, gstallocators_dep],
   }
 
   library_def += {'gir': [gir]}
@@ -118,8 +123,8 @@ if build_gir
 endif
 gst_libraries += [[pkg_name, library_def]]
 
-pkgconfig.generate(
-  libraries : [gst_dep, gstbase_dep, gstvideo_dep, gsthip],
+pkgconfig.generate(gsthip,
+  libraries : [gst_dep, gstbase_dep, gstvideo_dep, gstallocators_dep],
   variables : pkgconfig_variables,
   subdirs : pkgconfig_subdirs,
   name : pkg_name,

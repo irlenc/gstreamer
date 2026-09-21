@@ -390,7 +390,7 @@ gst_vulkan_vp9_decoder_decide_allocation (GstVideoDecoder * decoder,
 
   gst_vulkan_image_buffer_pool_config_set_allocation_params (config, usage,
       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR,
-      VK_ACCESS_TRANSFER_WRITE_BIT);
+      VK_ACCESS_NONE);
   gst_vulkan_image_buffer_pool_config_set_decode_caps (config, profile_caps);
 
   gst_caps_unref (profile_caps);
@@ -902,7 +902,7 @@ gst_vulkan_vp9_decoder_decode_picture (GstVp9Decoder * decoder,
   };
   /* *INDENT-ON* */
 
-  for (i = 0; i < VK_MAX_VIDEO_VP9_REFERENCES_PER_FRAME_KHR; i++) {
+  for (i = 0; i < GST_VP9_REFS_PER_FRAME; i++) {
     GstVp9Picture *ref_pic = dpb->pic_list[fh->ref_frame_idx[i]];
     if (ref_pic) {
       GstVulkanVp9Picture *ref_vk_pic =
@@ -923,8 +923,8 @@ gst_vulkan_vp9_decoder_decode_picture (GstVp9Decoder * decoder,
   /* fill main slot */
   _fill_ref_slot (self, picture, &pic->base.slot, &pic->base.pic_res, NULL);
 
-  for (i = 0; i < GST_VP9_REF_FRAME_MAX; i++) {
-    GstVp9Picture *ref_pic = dpb->pic_list[i];
+  for (i = 0; i < GST_VP9_REFS_PER_FRAME; i++) {
+    GstVp9Picture *ref_pic = dpb->pic_list[fh->ref_frame_idx[i]];
     gboolean found = FALSE;
     GstVulkanVp9Picture *ref_vk_pic;
 

@@ -39,10 +39,12 @@
 #include "shaders/yuy2_to_rgb.frag.h"
 #include "shaders/ayuv_to_rgb.frag.h"
 #include "shaders/nv12_to_rgb.frag.h"
+#include "shaders/i420_to_rgb.frag.h"
 #include "shaders/av12_to_rgb.frag.h"
 #include "shaders/rgb_to_ayuv.frag.h"
 #include "shaders/rgb_to_yuy2.frag.h"
 #include "shaders/rgb_to_nv12.frag.h"
+#include "shaders/rgb_to_i420.frag.h"
 #include "shaders/rgb_to_av12.frag.h"
 #include "shaders/rgbx_to_av12.frag.h"
 
@@ -53,7 +55,7 @@ GST_DEBUG_CATEGORY (gst_debug_vulkan_color_convert);
 
 /* Shader table size: 8 RGB-like formats converted between each other, plus
  * 8 RGB-like formats * 4 YUV-like formats * 2 directions (RGB<->YUV). */
-#define N_SHADER_INFO (8*8 + 8*4*2)
+#define N_SHADER_INFO (8*8 + 8*5*2)
 static shader_info shader_infos[N_SHADER_INFO];
 
 static void
@@ -285,17 +287,13 @@ convert_to_RGB (ConvertInfo * conv, Matrix4 * m)
 
   {
     const GstVideoFormatInfo *uinfo;
-    gint offset[4], scale[4], depth[4];
-    int i;
+    gdouble offset[4], scale[4], depth[4];
 
     uinfo = gst_video_format_get_info (GST_VIDEO_INFO_FORMAT (info));
 
     /* bring color components to [0..1.0] range */
-    gst_video_color_range_offsets (info->colorimetry.range, uinfo, offset,
-        scale);
-
-    for (i = 0; i < uinfo->n_components; i++)
-      depth[i] = (1 << uinfo->depth[i]) - 1;
+    gst_video_color_range_offsets_full (info->colorimetry.range, uinfo,
+        offset, scale, depth);
 
     matrix_offset_components (m, -offset[0] / (float) depth[0],
         -offset[1] / (float) depth[1], -offset[2] / (float) depth[2]);
@@ -363,17 +361,13 @@ convert_to_YUV (ConvertInfo * conv, Matrix4 * m)
 
   {
     const GstVideoFormatInfo *uinfo;
-    gint offset[4], scale[4], depth[4];
-    int i;
+    gdouble offset[4], scale[4], depth[4];
 
     uinfo = gst_video_format_get_info (GST_VIDEO_INFO_FORMAT (info));
 
     /* bring color components to nominal range */
-    gst_video_color_range_offsets (info->colorimetry.range, uinfo, offset,
-        scale);
-
-    for (i = 0; i < uinfo->n_components; i++)
-      depth[i] = (1 << uinfo->depth[i]) - 1;
+    gst_video_color_range_offsets_full (info->colorimetry.range,
+        uinfo, offset, scale, depth);
 
     matrix_scale_components (m, scale[0] / (float) depth[0],
         scale[1] / (float) depth[1], scale[2] / (float) depth[2]);
@@ -521,6 +515,7 @@ video_format_to_reorder (GstVideoFormat v_format, gint * reorder,
       reorder[2] = 0;
       reorder[3] = input ? 3 : 2;
       break;
+    case GST_VIDEO_FORMAT_I420:
     case GST_VIDEO_FORMAT_NV12:
       reorder[0] = 0;
       reorder[1] = 1;
@@ -780,7 +775,7 @@ GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE_WITH_FEATURES
         (GST_CAPS_FEATURE_MEMORY_VULKAN_IMAGE,
-            "{ BGRA, RGBA, ABGR, ARGB, BGRx, RGBx, xBGR, xRGB, AYUV, YUY2, NV12, AV12 }")));
+            "{ BGRA, RGBA, ABGR, ARGB, BGRx, RGBx, xBGR, xRGB, AYUV, YUY2, NV12, I420, AV12 }")));
 
 static GstStaticPadTemplate gst_vulkan_src_template =
 GST_STATIC_PAD_TEMPLATE ("src",
@@ -788,7 +783,7 @@ GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE_WITH_FEATURES
         (GST_CAPS_FEATURE_MEMORY_VULKAN_IMAGE,
-            "{ BGRA, RGBA, ABGR, ARGB, BGRx, RGBx, xBGR, xRGB, AYUV, YUY2, NV12, AV12 }")));
+            "{ BGRA, RGBA, ABGR, ARGB, BGRx, RGBx, xBGR, xRGB, AYUV, YUY2, NV12, I420, AV12 }")));
 
 enum
 {
@@ -838,6 +833,8 @@ fill_shader_info (void)
         rgb_to_yuy2_frag, rgb_to_yuy2_frag_size},*/
     {GST_VIDEO_FORMAT_NV12, nv12_to_rgb_frag, nv12_to_rgb_frag_size,
         rgb_to_nv12_frag, rgb_to_nv12_frag_size, NULL, 0},
+    {GST_VIDEO_FORMAT_I420, i420_to_rgb_frag, i420_to_rgb_frag_size,
+        rgb_to_i420_frag, rgb_to_i420_frag_size, NULL, 0},
     {GST_VIDEO_FORMAT_AV12, av12_to_rgb_frag, av12_to_rgb_frag_size,
           rgb_to_av12_frag, rgb_to_av12_frag_size,
         rgbx_to_av12_frag, rgbx_to_av12_frag_size},
@@ -997,7 +994,7 @@ _init_supported_formats (GstVulkanDevice * device, gboolean output,
       "BGRx", "BGRA", "xRGB", "xBGR", "ARGB", "ABGR", NULL);
 
   _append_value_string_list (supported_formats, "AYUV", "YUY2", /*"UYVY", */
-      "NV12", "AV12", NULL);
+      "NV12", "I420", "AV12", NULL);
 }
 
 /* copies the given caps */

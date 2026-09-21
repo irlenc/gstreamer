@@ -1,5 +1,8 @@
-/* GStreamer
- * Copyright (C) 2026 Seungha Yang <seungha@centricular.com>
+/*
+ * GStreamer gstreamer-onnxinference
+ * Copyright (C) 2026 Nirbheek Chauhan <nirbheek@centricular.com>
+ *
+ * gstonnx-utils.h
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -17,18 +20,28 @@
  * Boston, MA 02110-1301, USA.
  */
 
-#pragma once
+#ifndef __GST_ONNX_UTILS_H__
+#define __GST_ONNX_UTILS_H__
 
-#include <gst/d3d12/gstd3d12.h>
-#include <onnxruntime_c_api.h>
+#ifdef __linux__
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+#endif
+
+#include <glib.h>
+
+#ifdef G_OS_WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#define GST_DLOPEN_OPTS (RTLD_NOW | RTLD_LOCAL)
+#endif
 
 G_BEGIN_DECLS
 
-typedef struct _GstOnnxDmlCtx GstOnnxDmlCtx;
-
-GstOnnxDmlCtx * gst_onnx_dml_create_context (GstD3D12Device * device12,
-                                             OrtSessionOptions * opt);
-
-void gst_onnx_dml_free_context (GstOnnxDmlCtx * ctx);
+gpointer gst_onnx_find_onnxrt (void);
 
 G_END_DECLS
+
+#endif /* __GST_ONNX_UTILS_H__ */

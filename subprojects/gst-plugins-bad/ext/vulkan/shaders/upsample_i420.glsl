@@ -1,5 +1,5 @@
 /* GStreamer
- * Copyright (C) 2026
+ * Copyright (C) 2026 aisuneko icecat <iceneko@protonmail.ch>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -13,18 +13,18 @@
  *
  * You should have received a copy of the GNU Library General Public
  * License along with this library; if not, write to the
- * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
- * Boston, MA 02110-1301, USA.
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 02111-1307, USA.
  */
 
-#pragma once
+#include "swizzle.glsl"
 
-#include <glib.h>
+vec3 upsample_I420(in sampler2D Ytex, in sampler2D Utex, in sampler2D Vtex, in vec2 texCoord, in ivec4 inReorderIdx)
+{
+  vec3 yuv;
+  yuv.x = texture(Ytex, texCoord).x;
+  yuv.y = texture(Utex, texCoord).x;
+  yuv.z = texture(Vtex, texCoord).x;
 
-#ifdef G_OS_WIN32
-#include <gst/d3d11/gstd3d11.h>
-typedef GstD3D11Device GST_AMF_PLATFORM_DEVICE;
-#else
-typedef void GST_AMF_PLATFORM_DEVICE;
-#endif // G_OS_WIN32
-
+  return swizzle(yuv, inReorderIdx.xyz);
+}

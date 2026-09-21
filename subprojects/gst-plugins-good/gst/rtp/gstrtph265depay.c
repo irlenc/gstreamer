@@ -128,6 +128,8 @@ static gboolean gst_rtp_h265_depay_handle_event (GstRTPBaseDepayload * depay,
     GstEvent * event);
 static GstBuffer *gst_rtp_h265_complete_au (GstRtpH265Depay * rtph265depay,
     GstClockTime * out_timestamp, gboolean * out_keyframe);
+static gboolean gst_rtp_h265_depay_handle_nal (GstRtpH265Depay * rtph265depay,
+    GstBuffer * nal, GstClockTime in_timestamp, gboolean marker);
 static void gst_rtp_h265_depay_push (GstRtpH265Depay * rtph265depay,
     GstBuffer * outbuf, gboolean keyframe, GstClockTime timestamp,
     gboolean marker);
@@ -293,6 +295,8 @@ gst_rtp_h265_depay_reset (GstRtpH265Depay * rtph265depay, gboolean hard)
   rtph265depay->last_ts = 0;
   rtph265depay->current_fu_type = 0;
   rtph265depay->new_codec_data = FALSE;
+  gst_buffer_replace (&rtph265depay->meta_buf, NULL);
+  rtph265depay->meta_buf_ts = GST_CLOCK_TIME_NONE;
   g_ptr_array_set_size (rtph265depay->vps, 0);
   g_ptr_array_set_size (rtph265depay->sps, 0);
   g_ptr_array_set_size (rtph265depay->pps, 0);
@@ -330,6 +334,8 @@ gst_rtp_h265_depay_finalize (GObject * object)
 
   if (rtph265depay->codec_data)
     gst_buffer_unref (rtph265depay->codec_data);
+
+  gst_buffer_replace (&rtph265depay->meta_buf, NULL);
 
   g_object_unref (rtph265depay->adapter);
   g_object_unref (rtph265depay->picture_adapter);
@@ -1265,7 +1271,7 @@ gst_rtp_h265_depay_push (GstRtpH265Depay * rtph265depay, GstBuffer * outbuf,
   gst_rtp_base_depayload_push (GST_RTP_BASE_DEPAYLOAD (rtph265depay), outbuf);
 }
 
-static void
+static gboolean
 gst_rtp_h265_depay_handle_nal (GstRtpH265Depay * rtph265depay, GstBuffer * nal,
     GstClockTime in_timestamp, gboolean marker)
 {
@@ -1275,6 +1281,7 @@ gst_rtp_h265_depay_handle_nal (GstRtpH265Depay * rtph265depay, GstBuffer * nal,
   GstBuffer *outbuf = NULL;
   GstClockTime out_timestamp;
   gboolean keyframe, out_keyframe;
+  gboolean consumed = TRUE;
 
   gst_buffer_map (nal, &map, GST_MAP_READ);
   if (G_UNLIKELY (map.size < 5))
@@ -1296,7 +1303,7 @@ gst_rtp_h265_depay_handle_nal (GstRtpH265Depay * rtph265depay, GstBuffer * nal,
               4, gst_buffer_get_size (nal) - 4));
       gst_buffer_unmap (nal, &map);
       gst_buffer_unref (nal);
-      return;
+      return consumed;
     } else if (rtph265depay->sps->len == 0 || rtph265depay->pps->len == 0) {
       /* Down push down any buffer in non-bytestream mode if the SPS/PPS haven't
        * go through yet
@@ -1307,7 +1314,8 @@ gst_rtp_h265_depay_handle_nal (GstRtpH265Depay * rtph265depay, GstBuffer * nal,
                   "all-headers", G_TYPE_BOOLEAN, TRUE, NULL)));
       gst_buffer_unmap (nal, &map);
       gst_buffer_unref (nal);
-      return;
+      consumed = FALSE;
+      return consumed;
     }
 
     if (rtph265depay->new_codec_data &&
@@ -1343,6 +1351,11 @@ gst_rtp_h265_depay_handle_nal (GstRtpH265Depay * rtph265depay, GstBuffer * nal,
     /* add to adapter */
     gst_buffer_unmap (nal, &map);
 
+    if (rtph265depay->meta_buf && rtph265depay->meta_buf_ts == in_timestamp) {
+      nal = gst_buffer_make_writable (nal);
+      gst_rtp_copy_video_meta (rtph265depay, nal, rtph265depay->meta_buf);
+    }
+
     if (!rtph265depay->picture_start && start && out_keyframe) {
       rtph265depay->waiting_for_keyframe = FALSE;
       rtph265depay->requesting_keyframe = FALSE;
@@ -1362,6 +1375,11 @@ gst_rtp_h265_depay_handle_nal (GstRtpH265Depay * rtph265depay, GstBuffer * nal,
     GST_DEBUG_OBJECT (depayload, "using NAL as output");
     outbuf = nal;
     gst_buffer_unmap (nal, &map);
+
+    if (rtph265depay->meta_buf && rtph265depay->meta_buf_ts == in_timestamp) {
+      outbuf = gst_buffer_make_writable (outbuf);
+      gst_rtp_copy_video_meta (rtph265depay, outbuf, rtph265depay->meta_buf);
+    }
   }
 
   if (outbuf) {
@@ -1383,11 +1401,14 @@ gst_rtp_h265_depay_handle_nal (GstRtpH265Depay * rtph265depay, GstBuffer * nal,
       GST_INFO_OBJECT (depayload,
           "Dropping %" GST_PTR_FORMAT ", we are waiting for a keyframe",
           outbuf);
+      gst_rtp_base_depayload_flush (depayload, FALSE);
       gst_buffer_unref (outbuf);
+      if (marker)
+        consumed = FALSE;
     }
   }
 
-  return;
+  return consumed;
 
   /* ERRORS */
 short_nal:
@@ -1395,7 +1416,8 @@ short_nal:
     GST_WARNING_OBJECT (depayload, "dropping short NAL");
     gst_buffer_unmap (nal, &map);
     gst_buffer_unref (nal);
-    return;
+    consumed = FALSE;
+    return consumed;
   }
 }
 
@@ -1423,8 +1445,10 @@ gst_rtp_h265_finish_fragmentation_unit (GstRtpH265Depay * rtph265depay)
 
   rtph265depay->current_fu_type = 0;
 
-  gst_rtp_h265_depay_handle_nal (rtph265depay, outbuf,
-      rtph265depay->fu_timestamp, rtph265depay->fu_marker);
+  /* if the finished FU was dropped, flush its delayed header extensions */
+  if (!gst_rtp_h265_depay_handle_nal (rtph265depay, outbuf,
+          rtph265depay->fu_timestamp, rtph265depay->fu_marker))
+    gst_rtp_base_depayload_flush (GST_RTP_BASE_DEPAYLOAD (rtph265depay), FALSE);
 }
 
 static GstBuffer *
@@ -1465,11 +1489,19 @@ gst_rtp_h265_depay_process (GstRTPBaseDepayload * depayload, GstRTPBuffer * rtp)
     guint8 nuh_layer_id, nuh_temporal_id_plus1;
     guint8 S, E;
     guint16 nal_header;
+    gboolean consumed = FALSE;
 #if 0
     gboolean donl_present = FALSE;
 #endif
 
     timestamp = GST_BUFFER_PTS (rtp->buffer);
+
+    /* Save the first RTP buffer of each new frame so that video meta can
+     * be re-applied after parameter-set diversion or FU adapter assembly. */
+    if (rtph265depay->meta_buf_ts != timestamp) {
+      gst_buffer_replace (&rtph265depay->meta_buf, rtp->buffer);
+      rtph265depay->meta_buf_ts = timestamp;
+    }
 
     payload_len = gst_rtp_buffer_get_payload_len (rtp);
     payload = gst_rtp_buffer_get_payload (rtp);
@@ -1588,7 +1620,8 @@ gst_rtp_h265_depay_process (GstRTPBaseDepayload * depayload, GstRTPBuffer * rtp)
           if (payload_len - nalu_size <= 2)
             last = TRUE;
 
-          gst_rtp_h265_depay_handle_nal (rtph265depay, outbuf, timestamp,
+          consumed |=
+              gst_rtp_h265_depay_handle_nal (rtph265depay, outbuf, timestamp,
               marker && last);
 
           payload += nalu_size;
@@ -1706,6 +1739,7 @@ gst_rtp_h265_depay_process (GstRTPBaseDepayload * depayload, GstRTPBuffer * rtp)
             GST_WARNING_OBJECT (rtph265depay, "missing FU start bit on an "
                 "earlier packet. Dropping.");
             gst_rtp_base_depayload_flush (depayload, FALSE);
+            gst_rtp_base_depayload_dropped (depayload);
             gst_adapter_clear (rtph265depay->adapter);
             return NULL;
           }
@@ -1720,6 +1754,7 @@ gst_rtp_h265_depay_process (GstRTPBaseDepayload * depayload, GstRTPBuffer * rtp)
             rtph265depay->current_fu_type = 0;
             rtph265depay->last_fu_seqnum = 0;
             gst_rtp_base_depayload_flush (depayload, FALSE);
+            gst_rtp_base_depayload_dropped (depayload);
             gst_adapter_clear (rtph265depay->adapter);
             return NULL;
           }
@@ -1762,6 +1797,7 @@ gst_rtp_h265_depay_process (GstRTPBaseDepayload * depayload, GstRTPBuffer * rtp)
             rtph265depay->current_fu_type = 0;
             rtph265depay->last_fu_seqnum = 0;
             gst_rtp_base_depayload_flush (depayload, FALSE);
+            gst_rtp_base_depayload_dropped (depayload);
             gst_adapter_clear (rtph265depay->adapter);
             return NULL;
           }
@@ -1797,10 +1833,18 @@ gst_rtp_h265_depay_process (GstRTPBaseDepayload * depayload, GstRTPBuffer * rtp)
 
         gst_rtp_copy_video_meta (rtph265depay, outbuf, rtp->buffer);
 
-        gst_rtp_h265_depay_handle_nal (rtph265depay, outbuf, timestamp, marker);
+        consumed =
+            gst_rtp_h265_depay_handle_nal (rtph265depay, outbuf, timestamp,
+            marker);
         break;
       }
     }
+
+    /* drop the current packet's delayed header extensions if nothing was
+     * consumed and we're not in the middle of a FU. Otherwise header extensions
+     * of dropped packets would leak into the next output buffer. */
+    if (!consumed && rtph265depay->current_fu_type == 0)
+      gst_rtp_base_depayload_dropped (depayload);
   }
 
   return NULL;

@@ -636,13 +636,14 @@ gst_webrtc_nice_fill_local_candidate_credentials (NiceAgent * agent,
 {
 
   if (!candidate->username || !candidate->password) {
-    gboolean got_credentials;
-    gchar *ufrag, *password;
+    gchar *ufrag = NULL, *password = NULL;
 
-    got_credentials =
-        nice_agent_get_local_credentials (agent, candidate->stream_id, &ufrag,
-        &password);
-    g_warn_if_fail (got_credentials);
+    if (!nice_agent_get_local_credentials (agent, candidate->stream_id, &ufrag,
+            &password)) {
+      g_warning ("Failed to get local credentials for stream %u",
+          candidate->stream_id);
+      return;
+    }
 
     if (!candidate->username)
       candidate->username = ufrag;
@@ -672,7 +673,6 @@ _on_new_candidate (NiceAgent * agent, NiceCandidate * candidate,
     GstWebRTCNice * ice)
 {
   struct NiceStreamItem *item;
-  NiceCandidate *c;
   gchar *attr;
 
   item = _find_item (ice, -1, candidate->stream_id, NULL);
@@ -682,12 +682,7 @@ _on_new_candidate (NiceAgent * agent, NiceCandidate * candidate,
     return;
   }
 
-  c = nice_candidate_copy (candidate);
-  gst_webrtc_nice_fill_local_candidate_credentials (agent, c);
-
-  attr = nice_agent_generate_local_candidate_sdp (agent, c);
-
-  nice_candidate_free (c);
+  attr = nice_agent_generate_local_candidate_sdp (agent, candidate);
 
   if (ice->priv->on_candidate)
     ice->priv->on_candidate (GST_WEBRTC_ICE (ice), item->session_id, attr,
