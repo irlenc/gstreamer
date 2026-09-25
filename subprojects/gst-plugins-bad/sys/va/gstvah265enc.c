@@ -63,6 +63,7 @@
 #endif
 
 #include "gstvah265enc.h"
+#include "gstvah265skip.h"
 
 #include <gst/codecparsers/gsth265bitwriter.h>
 #include <gst/va/gstva.h>
@@ -113,6 +114,9 @@ enum
   PROP_AUD,
   PROP_NUM_TILE_COLS,
   PROP_NUM_TILE_ROWS,
+  PROP_SKIP_REPEATS,
+  /* Must stay last: class_init drops it when rate control is not
+   * supported. */
   PROP_RATE_CONTROL,
   N_PROPERTIES
 };
@@ -184,6 +188,7 @@ struct _GstVaH265Enc
     guint32 cpb_size;
     guint32 target_percentage;
     guint32 target_usage;
+    gboolean skip_repeats;
   } prop;
 
   /* H265 fields */
@@ -363,6 +368,15 @@ struct _GstVaH265Enc
   /* The rate control was retuned without a reconfig and the next
    * picture has to carry the new parameters. */
   gboolean rc_update_pending;
+
+  gboolean skip_repeats;
+  /* Consecutive repeats coded as skip pictures since the last coded
+   * picture. */
+  guint skip_run;
+  /* The PPS of the stream, as the last I picture wrote it. A skip
+   * picture refers to it. */
+  GstH265PPS skip_pps;
+  gboolean skip_pps_valid;
 };
 
 struct _GstVaH265EncFrame
@@ -377,6 +391,11 @@ struct _GstVaH265EncFrame
 
   gint poc;
   gboolean last_frame;
+
+  /* Coded on the CPU as a picture of skipped coding units, never
+   * submitted to the hardware. */
+  gboolean is_skip;
+  GstBuffer *skip_buffer;
 };
 
 /**
@@ -461,6 +480,9 @@ gst_va_h265_enc_frame_new (void)
   frame = g_new (GstVaH265EncFrame, 1);
   frame->last_frame = FALSE;
   frame->base.picture = NULL;
+  frame->base.repeat = FALSE;
+  frame->is_skip = FALSE;
+  frame->skip_buffer = NULL;
 
   return frame;
 }
@@ -470,6 +492,7 @@ gst_va_h265_enc_frame_free (gpointer pframe)
 {
   GstVaH265EncFrame *frame = pframe;
   g_clear_pointer (&frame->base.picture, gst_va_encode_picture_free);
+  gst_clear_buffer (&frame->skip_buffer);
   g_free (frame);
 }
 
@@ -2028,9 +2051,16 @@ _h265_encode_one_frame (GstVaH265Enc * self, GstVideoCodecFrame * gst_frame)
   _h265_fill_pps (self, &pic_param, &self->sps_hdr, &pps);
 
   if ((self->packed_headers & VA_ENC_PACKED_HEADER_PICTURE)
-      && frame->type == GST_H265_I_SLICE
-      && !_h265_add_pps_header (self, frame, &pps))
-    return FALSE;
+      && frame->type == GST_H265_I_SLICE) {
+    if (!_h265_add_pps_header (self, frame, &pps))
+      return FALSE;
+
+    /* Only a PPS and SPS gstva wrote itself describe the stream. */
+    if (self->packed_headers & VA_ENC_PACKED_HEADER_SEQUENCE) {
+      self->skip_pps = pps;
+      self->skip_pps_valid = TRUE;
+    }
+  }
 
   if (!_h265_add_slices (self, frame, &pps,
           list_forward, list_forward_num, list_backward, list_backward_num,
@@ -2055,6 +2085,39 @@ frame_setup_from_gop (GstVaH265Enc * self, GstVaH265EncFrame * frame, guint i)
   frame->pyramid_level = self->gop.frame_types[i].pyramid_level;
   frame->left_ref_poc_diff = self->gop.frame_types[i].left_ref_poc_diff;
   frame->right_ref_poc_diff = self->gop.frame_types[i].right_ref_poc_diff;
+}
+
+/* A repeat can be a skip picture only where the GOP puts a P picture
+ * and nothing is reordered: the skip picture copies the most recent
+ * reference, which without B pictures is the last coded picture, and
+ * the repeat's content is by definition the same as that one's. The
+ * skip picture is a P slice even where the driver codes P pictures as
+ * low delay B: it is written on the CPU, so only the SPS and PPS bind
+ * it.
+ *
+ * A skip picture is a sub-layer non-reference picture, so it is never
+ * prevTid0Pic and the POC of a run of them is derived from the last
+ * reference (8.3.1). The run has to stay inside half the POC LSB range
+ * of that reference, and a long run on still content is broken by a
+ * coded picture now and then so the reference can keep converging on
+ * the source. */
+#define MAX_SKIP_RUN 8
+
+static void
+_decide_skip (GstVaH265Enc * self, GstVaH265EncFrame * frame)
+{
+  guint max_run = MIN (MAX_SKIP_RUN, self->gop.max_pic_order_cnt / 4 - 1);
+
+  if (self->skip_repeats && frame->base.repeat
+      && frame->type == GST_H265_P_SLICE && self->gop.num_bframes == 0
+      && self->skip_pps_valid && !_is_tile_enabled (self)
+      && !_is_scc_enabled (self) && self->skip_run < max_run) {
+    frame->is_skip = TRUE;
+    frame->is_ref = FALSE;
+    self->skip_run++;
+  } else {
+    self->skip_run = 0;
+  }
 }
 
 static gboolean
@@ -2119,6 +2182,7 @@ _h265_push_one_frame (GstVaBaseEnc * base, GstVideoCodecFrame * gst_frame,
       }
 
       frame_setup_from_gop (self, frame, self->gop.cur_frame_index);
+      _decide_skip (self, frame);
 
       GST_LOG_OBJECT (self, "Push frame, system_frame_number: %u, poc %d, "
           "frame type %s", gst_frame->system_frame_number, frame->poc,
@@ -2446,6 +2510,65 @@ _sort_by_poc (gconstpointer a, gconstpointer b, gpointer user_data)
   return frame1->poc - frame2->poc;
 }
 
+static gboolean
+_h265_encode_skip_frame (GstVaH265Enc * self, GstVaH265EncFrame * frame)
+{
+  GstVaBaseEnc *base = GST_VA_BASE_ENC (self);
+  GstH265SliceHdr slice_hdr = {
+    .pps = &self->skip_pps,
+    .pic_order_cnt_lsb = frame->poc,
+    .short_term_ref_pic_set_sps_flag = 0,
+    .qp_delta = 0,
+  };
+  GstH265ShortTermRefPicSet *rps = &slice_hdr.short_term_ref_pic_sets;
+  GstBuffer *picture;
+  guint num_refs = 0;
+  gint i;
+
+  /* The reference picture set lists every reference gstva keeps, since
+   * the decoder drops what it leaves out. Only the most recent one,
+   * the picture the repeat copies, is used by the skip picture. */
+  for (i = g_queue_get_length (&base->ref_list) - 1; i >= 0; i--) {
+    GstVaH265EncFrame *ref = _enc_frame (g_queue_peek_nth (&base->ref_list,
+            i));
+
+    g_assert (ref->poc < frame->poc);
+    g_assert (num_refs < G_N_ELEMENTS (rps->DeltaPocS0));
+
+    rps->DeltaPocS0[num_refs] = ref->poc - frame->poc;
+    rps->UsedByCurrPicS0[num_refs] = (num_refs == 0);
+    num_refs++;
+  }
+  rps->NumNegativePics = num_refs;
+  rps->NumDeltaPocs = num_refs;
+
+  picture = gst_va_h265_skip_picture_new (&slice_hdr);
+  if (!picture) {
+    GST_ERROR_OBJECT (self, "Failed to build the skip picture");
+    return FALSE;
+  }
+
+  if (self->aud) {
+    guint8 aud_data[8] = { 0, };
+    guint size = sizeof (aud_data);
+
+    /* pic_type 1: I or P slices */
+    if (gst_h265_bit_writer_aud (1, TRUE, aud_data, &size) !=
+        GST_H265_BIT_WRITER_OK) {
+      gst_buffer_unref (picture);
+      return FALSE;
+    }
+    picture = gst_buffer_append (gst_buffer_new_memdup (aud_data, size),
+        picture);
+  }
+
+  GST_LOG_OBJECT (self, "Repeat coded as a skip picture, poc %d, %u refs",
+      frame->poc, num_refs);
+
+  frame->skip_buffer = picture;
+  return TRUE;
+}
+
 static GstFlowReturn
 gst_va_h265_enc_encode_frame (GstVaBaseEnc * base,
     GstVideoCodecFrame * gst_frame, gboolean is_last)
@@ -2456,6 +2579,15 @@ gst_va_h265_enc_encode_frame (GstVaBaseEnc * base,
 
   frame = _enc_frame (gst_frame);
   frame->last_frame = is_last;
+
+  if (frame->is_skip) {
+    if (!_h265_encode_skip_frame (self, frame))
+      return GST_FLOW_ERROR;
+
+    g_queue_push_tail (&base->output_list,
+        gst_video_codec_frame_ref (gst_frame));
+    return GST_FLOW_OK;
+  }
 
   g_assert (frame->base.picture == NULL);
   frame->base.picture = gst_va_encode_picture_new (base->encoder,
@@ -2524,6 +2656,7 @@ gst_va_h265_enc_reset_state (GstVaBaseEnc * base)
   self->rc.target_percentage = self->prop.target_percentage;
   self->rc.target_usage = self->prop.target_usage;
   self->rc.cpb_size = self->prop.cpb_size;
+  self->skip_repeats = self->prop.skip_repeats;
   GST_OBJECT_UNLOCK (self);
 
   self->level_idc = 0;
@@ -2612,6 +2745,9 @@ gst_va_h265_enc_reset_state (GstVaBaseEnc * base)
   self->rc.target_bitrate_bits = 0;
   self->rc.cpb_length_bits = 0;
   self->rc_update_pending = FALSE;
+
+  self->skip_run = 0;
+  self->skip_pps_valid = FALSE;
 
   memset (&self->vps_hdr, 0, sizeof (GstH265VPS));
   memset (&self->sps_hdr, 0, sizeof (GstH265SPS));
@@ -4837,8 +4973,12 @@ gst_va_h265_enc_prepare_output (GstVaBaseEnc * base,
     frame->dts = frame->pts;
   }
 
-  buf = gst_va_base_enc_create_output_buffer (base,
-      frame_enc->base.picture, NULL, 0);
+  if (frame_enc->skip_buffer) {
+    buf = g_steal_pointer (&frame_enc->skip_buffer);
+  } else {
+    buf = gst_va_base_enc_create_output_buffer (base,
+        frame_enc->base.picture, NULL, 0);
+  }
   if (!buf) {
     GST_ERROR_OBJECT (base, "Failed to create output buffer");
     return FALSE;
@@ -4903,6 +5043,7 @@ gst_va_h265_enc_init (GTypeInstance * instance, gpointer g_class)
   self->prop.target_percentage = 66;
   self->prop.target_usage = 4;
   self->prop.cpb_size = 0;
+  self->prop.skip_repeats = FALSE;
   if (properties[PROP_RATE_CONTROL]) {
     self->prop.rc_ctrl =
         G_PARAM_SPEC_ENUM (properties[PROP_RATE_CONTROL])->default_value;
@@ -5012,6 +5153,9 @@ gst_va_h265_enc_set_property (GObject * object, guint prop_id,
       break;
     case PROP_NUM_TILE_ROWS:
       self->prop.num_tile_rows = g_value_get_uint (value);
+      break;
+    case PROP_SKIP_REPEATS:
+      self->prop.skip_repeats = g_value_get_boolean (value);
       break;
     case PROP_RATE_CONTROL:
       self->prop.rc_ctrl = g_value_get_enum (value);
@@ -5123,6 +5267,9 @@ gst_va_h265_enc_get_property (GObject * object, guint prop_id,
       break;
     case PROP_NUM_TILE_ROWS:
       g_value_set_uint (value, self->prop.num_tile_rows);
+      break;
+    case PROP_SKIP_REPEATS:
+      g_value_set_boolean (value, self->prop.skip_repeats);
       break;
     case PROP_RATE_CONTROL:
       g_value_set_enum (value, self->prop.rc_ctrl);
@@ -5457,6 +5604,23 @@ gst_va_h265_enc_class_init (gpointer g_klass, gpointer class_data)
   properties[PROP_NUM_TILE_ROWS] = g_param_spec_uint ("num-tile-rows",
       "number of tile rows", "The number of rows for tile encoding",
       1, MAX_ROW_TILES, 1, param_flags);
+
+  /**
+   * GstVaH265Enc:skip-repeats:
+   *
+   * Code an input that shares its memory with the previous input as a
+   * non-reference picture of skipped coding units, built on the CPU
+   * instead of encoded by the hardware. Upstream elements that repeat a
+   * frame by reference (videorate, a compositor with unchanged inputs)
+   * then cost no encoder time for the repeat. Only without B frames and
+   * without tiles.
+   *
+   * Since: 1.30
+   */
+  properties[PROP_SKIP_REPEATS] = g_param_spec_boolean ("skip-repeats",
+      "Skip repeated frames",
+      "Code repeated input frames as skip pictures without the hardware",
+      FALSE, param_flags);
 
   if (vah265enc_class->rate_control_type > 0) {
     properties[PROP_RATE_CONTROL] = g_param_spec_enum ("rate-control",
