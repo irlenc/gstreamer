@@ -717,6 +717,14 @@ _ensure_app_rate_control (GstVaH264Enc * self)
   }
 }
 
+/* Below this QP an easy picture (static, or moving in exact pixel steps)
+ * costs no more bits, so a controller chasing a bitrate it cannot spend
+ * walks the QP down to the floor, and a hard scene after it then takes
+ * many pictures of bounded QP steps to climb back. Live streams gain
+ * nothing from a lower QP. The driver's own CBR fills the gap with
+ * filler data instead; this rate control leaves the bits unspent. */
+#define APP_RC_MIN_QP 12
+
 static void
 _init_app_rate_control (GstVaH264Enc * self)
 {
@@ -730,7 +738,8 @@ _init_app_rate_control (GstVaH264Enc * self)
       self->rc.target_bitrate_bits, GST_VIDEO_INFO_FPS_N (&base->in_info),
       GST_VIDEO_INFO_FPS_D (&base->in_info), self->rc.cpb_length_bits,
       self->gop.i_period > 0 ? self->gop.i_period : self->gop.idr_period,
-      self->rc.min_qp, self->rc.max_qp, self->mb_width * self->mb_height * 256);
+      MAX (self->rc.min_qp, APP_RC_MIN_QP), self->rc.max_qp,
+      self->mb_width * self->mb_height * 256);
   gst_va_rate_control_set_divisor (&self->app_rate_control,
       self->coded_rate.divisor);
 
