@@ -37,6 +37,9 @@ struct _GstVaBaseEncPrivate
 {
   GstVideoInfo sinkpad_info;
   GstBufferPool *raw_pool;
+  /* Held so its memory cannot be recycled while a later input is
+   * compared against it. */
+  GstBuffer *last_input;
 };
 
 enum
@@ -78,11 +81,14 @@ gst_va_base_enc_reset_state_default (GstVaBaseEnc * base)
   base->min_buffers = 1;
   g_atomic_int_set (&base->reconf, FALSE);
   g_atomic_int_set (&base->rc_reconf, FALSE);
+  gst_clear_buffer (&base->priv->last_input);
 }
 
 static void
 _flush_all_frames (GstVaBaseEnc * base)
 {
+  gst_clear_buffer (&base->priv->last_input);
+
   g_queue_clear_full (&base->reorder_list,
       (GDestroyNotify) gst_video_codec_frame_unref);
   g_queue_clear_full (&base->output_list,
@@ -752,6 +758,32 @@ gst_va_base_enc_reset (GstVaBaseEnc * base)
   return TRUE;
 }
 
+/* A repeated frame reaches the encoder as a new buffer sharing the
+ * previous one's memory: videorate duplicates that way, and so does a
+ * compositor that reuses an unchanged output. Holding the last input
+ * keeps its memory from being recycled into a different picture, so
+ * equal memory means equal content. */
+static gboolean
+_input_repeats_last (GstVaBaseEnc * base, GstBuffer * input)
+{
+  GstBuffer *last = base->priv->last_input;
+  gboolean repeat = FALSE;
+  guint i, n;
+
+  n = gst_buffer_n_memory (input);
+  if (last && n > 0 && n == gst_buffer_n_memory (last)) {
+    repeat = TRUE;
+    for (i = 0; i < n && repeat; i++) {
+      repeat = gst_buffer_peek_memory (input, i) ==
+          gst_buffer_peek_memory (last, i);
+    }
+  }
+
+  gst_buffer_replace (&base->priv->last_input, input);
+
+  return repeat;
+}
+
 static GstFlowReturn
 gst_va_base_enc_handle_frame (GstVideoEncoder * venc,
     GstVideoCodecFrame * frame)
@@ -761,6 +793,7 @@ gst_va_base_enc_handle_frame (GstVideoEncoder * venc,
   GstFlowReturn ret;
   GstBuffer *in_buf = NULL;
   GstVideoCodecFrame *frame_encode = NULL;
+  gboolean repeat;
 
   GST_LOG_OBJECT (venc,
       "handle frame id %u, dts %" GST_TIME_FORMAT ", pts %" GST_TIME_FORMAT,
@@ -785,6 +818,8 @@ gst_va_base_enc_handle_frame (GstVideoEncoder * venc,
     }
   }
 
+  repeat = _input_repeats_last (base, frame->input_buffer);
+
   ret = gst_va_base_enc_import_input_buffer (base,
       frame->input_buffer, &in_buf);
   if (ret != GST_FLOW_OK)
@@ -795,6 +830,8 @@ gst_va_base_enc_handle_frame (GstVideoEncoder * venc,
 
   if (!base_class->new_frame (base, frame))
     goto error_new_frame;
+
+  ((GstVaEncFrame *) gst_va_get_enc_frame (frame))->repeat = repeat;
 
   if (!base_class->reorder_frame (base, frame, FALSE, &frame_encode))
     goto error_reorder;

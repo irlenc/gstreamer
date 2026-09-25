@@ -71,6 +71,7 @@
 #endif
 
 #include "gstvah264enc.h"
+#include "gstvah264skip.h"
 
 #include <gst/codecparsers/gsth264bitwriter.h>
 #include <gst/va/gstva.h>
@@ -122,6 +123,9 @@ enum
   PROP_CPB_SIZE,
   PROP_AUD,
   PROP_CC,
+  PROP_SKIP_REPEATS,
+  /* Must stay last: class_init drops it when rate control is not
+   * supported. */
   PROP_RATE_CONTROL,
   N_PROPERTIES
 };
@@ -186,6 +190,7 @@ struct _GstVaH264Enc
     guint32 cpb_size;
     guint32 target_percentage;
     guint32 target_usage;
+    gboolean skip_repeats;
   } prop;
 
   /* H264 fields */
@@ -284,6 +289,15 @@ struct _GstVaH264Enc
   /* The rate control was retuned without a reconfig and the next
    * picture has to carry the new parameters. */
   gboolean rc_update_pending;
+
+  gboolean skip_repeats;
+  /* Consecutive repeats coded as skip pictures since the last coded
+   * picture. */
+  guint skip_run;
+  /* The PPS of the stream, as the last coded picture wrote it. A skip
+   * picture refers to it. */
+  GstH264PPS skip_pps;
+  gboolean skip_pps_valid;
 };
 
 struct _GstVaH264EncFrame
@@ -304,6 +318,11 @@ struct _GstVaH264EncFrame
   gint unused_for_reference_pic_num;
 
   gboolean last_frame;
+
+  /* Coded on the CPU as a picture of skipped macroblocks, never
+   * submitted to the hardware. */
+  gboolean is_skip;
+  GstBuffer *skip_buffer;
 };
 
 #ifndef GST_DISABLE_GST_DEBUG
@@ -336,7 +355,10 @@ gst_va_enc_frame_new (void)
   frame->frame_num = 0;
   frame->unused_for_reference_pic_num = -1;
   frame->base.picture = NULL;
+  frame->base.repeat = FALSE;
   frame->last_frame = FALSE;
+  frame->is_skip = FALSE;
+  frame->skip_buffer = NULL;
 
   return frame;
 }
@@ -346,6 +368,7 @@ gst_va_enc_frame_free (gpointer pframe)
 {
   GstVaH264EncFrame *frame = pframe;
   g_clear_pointer (&frame->base.picture, gst_va_encode_picture_free);
+  gst_clear_buffer (&frame->skip_buffer);
   g_free (frame);
 }
 
@@ -1574,6 +1597,10 @@ gst_va_h264_enc_reset_state (GstVaBaseEnc * base)
   self->rc.cpb_length_bits = 0;
   self->rc_update_pending = FALSE;
 
+  self->skip_repeats = self->prop.skip_repeats;
+  self->skip_run = 0;
+  self->skip_pps_valid = FALSE;
+
   memset (&self->sequence_hdr, 0, sizeof (GstH264SPS));
 }
 
@@ -1731,6 +1758,39 @@ frame_setup_from_gop (GstVaH264Enc * self, GstVaH264EncFrame * frame, guint i)
   frame->right_ref_poc_diff = self->gop.frame_types[i].right_ref_poc_diff;
 }
 
+/* A repeat can be a skip picture only where the GOP puts a P picture
+ * and nothing is reordered: P_Skip copies the first picture of list 0,
+ * which without B pictures is the last coded one, and the repeat's
+ * content is by definition the same as that one's.
+ *
+ * A skip picture is not a reference, so it does not advance frame_num
+ * and the POC of a run of them is derived from the last reference
+ * (8.2.1.1). The run has to stay inside half the POC LSB range of that
+ * reference, and a long run on still content is broken by a coded
+ * picture now and then so the reference can keep converging on the
+ * source. */
+#define MAX_SKIP_RUN 8
+
+static void
+_decide_skip (GstVaH264Enc * self, GstVideoCodecFrame * gst_frame,
+    GstVaH264EncFrame * frame)
+{
+  guint max_run = MIN (MAX_SKIP_RUN, self->gop.max_pic_order_cnt / 4 - 1);
+  gboolean has_captions = self->cc && gst_buffer_get_meta
+      (gst_frame->input_buffer, GST_VIDEO_CAPTION_META_API_TYPE) != NULL;
+
+  if (self->skip_repeats && frame->base.repeat && !has_captions
+      && frame->type == GST_H264_P_SLICE && self->gop.num_bframes == 0
+      && self->skip_pps_valid && self->num_slices >= 1
+      && self->skip_run < max_run) {
+    frame->is_skip = TRUE;
+    frame->is_ref = FALSE;
+    self->skip_run++;
+  } else {
+    self->skip_run = 0;
+  }
+}
+
 static gboolean
 _push_one_frame (GstVaBaseEnc * base, GstVideoCodecFrame * gst_frame,
     gboolean last)
@@ -1796,6 +1856,7 @@ _push_one_frame (GstVaBaseEnc * base, GstVideoCodecFrame * gst_frame,
       }
 
       frame_setup_from_gop (self, frame, self->gop.cur_frame_index);
+      _decide_skip (self, gst_frame, frame);
 
       GST_LOG_OBJECT (self, "Push frame, system_frame_number: %u, poc %d, "
           "frame type %s", gst_frame->system_frame_number, frame->poc,
@@ -3095,6 +3156,8 @@ _encode_one_frame (GstVaH264Enc * self, GstVideoCodecFrame * gst_frame)
   if (!_add_picture_parameter (self, frame, &pic_param))
     return FALSE;
   _fill_pps (&pic_param, &self->sequence_hdr, &pps);
+  self->skip_pps = pps;
+  self->skip_pps_valid = TRUE;
 
   if ((self->packed_headers & VA_ENC_PACKED_HEADER_PICTURE)
       && frame->type == GST_H264_I_SLICE
@@ -3172,8 +3235,12 @@ gst_va_h264_enc_prepare_output (GstVaBaseEnc * base,
     frame->dts = frame->pts;
   }
 
-  buf = gst_va_base_enc_create_output_buffer (base,
-      frame_enc->base.picture, NULL, 0);
+  if (frame_enc->skip_buffer) {
+    buf = g_steal_pointer (&frame_enc->skip_buffer);
+  } else {
+    buf = gst_va_base_enc_create_output_buffer (base,
+        frame_enc->base.picture, NULL, 0);
+  }
   if (!buf) {
     GST_ERROR_OBJECT (base, "Failed to create output buffer");
     return FALSE;
@@ -3270,6 +3337,53 @@ _find_unused_reference_frame (GstVaH264Enc * self, GstVaH264EncFrame * frame)
   return b_frame;
 }
 
+static gboolean
+_encode_skip_frame (GstVaH264Enc * self, GstVaH264EncFrame * frame)
+{
+  GstH264SliceHdr slice_hdr = {
+    .first_mb_in_slice = 0,
+    .type = GST_H264_P_SLICE,
+    .pps = &self->skip_pps,
+    .frame_num = frame->frame_num,
+    .pic_order_cnt_lsb = frame->poc,
+    .num_ref_idx_active_override_flag = 1,
+    .num_ref_idx_l0_active_minus1 = 0,
+    .cabac_init_idc = 0,
+    .slice_qp_delta = 0,
+    /* No residual and zero motion leave nothing to filter. */
+    .disable_deblocking_filter_idc =
+        self->skip_pps.deblocking_filter_control_present_flag ? 1 : 0,
+  };
+  GstBuffer *picture;
+
+  picture = gst_va_h264_skip_picture_new (&slice_hdr,
+      self->mb_width * self->mb_height);
+  if (!picture) {
+    GST_ERROR_OBJECT (self, "Failed to build the skip picture");
+    return FALSE;
+  }
+
+  if (self->aud) {
+    guint8 aud_data[8] = { 0, };
+    guint size = sizeof (aud_data);
+
+    /* primary_pic_type 1: I or P slices */
+    if (gst_h264_bit_writer_aud (1, TRUE, aud_data, &size) !=
+        GST_H264_BIT_WRITER_OK) {
+      gst_buffer_unref (picture);
+      return FALSE;
+    }
+    picture = gst_buffer_append (gst_buffer_new_memdup (aud_data, size),
+        picture);
+  }
+
+  GST_LOG_OBJECT (self, "Repeat coded as a skip picture, poc %d, frame num %d",
+      frame->poc, frame->frame_num);
+
+  frame->skip_buffer = picture;
+  return TRUE;
+}
+
 static GstFlowReturn
 gst_va_h264_enc_encode_frame (GstVaBaseEnc * base,
     GstVideoCodecFrame * gst_frame, gboolean is_last)
@@ -3280,6 +3394,15 @@ gst_va_h264_enc_encode_frame (GstVaBaseEnc * base,
 
   frame = _enc_frame (gst_frame);
   frame->last_frame = is_last;
+
+  if (frame->is_skip) {
+    if (!_encode_skip_frame (self, frame))
+      return GST_FLOW_ERROR;
+
+    g_queue_push_tail (&base->output_list,
+        gst_video_codec_frame_ref (gst_frame));
+    return GST_FLOW_OK;
+  }
 
   g_assert (frame->base.picture == NULL);
   frame->base.picture = gst_va_encode_picture_new (base->encoder,
@@ -3384,6 +3507,7 @@ gst_va_h264_enc_init (GTypeInstance * instance, gpointer g_class)
   self->prop.use_trellis = FALSE;
   self->prop.aud = FALSE;
   self->prop.cc = TRUE;
+  self->prop.skip_repeats = FALSE;
   self->prop.mbbrc = 0;
   self->prop.bitrate = 0;
   self->prop.target_percentage = 66;
@@ -3467,6 +3591,9 @@ gst_va_h264_enc_set_property (GObject * object, guint prop_id,
       break;
     case PROP_CC:
       self->prop.cc = g_value_get_boolean (value);
+      break;
+    case PROP_SKIP_REPEATS:
+      self->prop.skip_repeats = g_value_get_boolean (value);
       break;
     case PROP_MBBRC:{
       /* Macroblock-level rate control.
@@ -3582,6 +3709,9 @@ gst_va_h264_enc_get_property (GObject * object, guint prop_id,
       break;
     case PROP_CC:
       g_value_set_boolean (value, self->prop.cc);
+      break;
+    case PROP_SKIP_REPEATS:
+      g_value_set_boolean (value, self->prop.skip_repeats);
       break;
     case PROP_MBBRC:{
       GstVaFeature mbbrc = GST_VA_FEATURE_AUTO;
@@ -3883,6 +4013,22 @@ gst_va_h264_enc_class_init (gpointer g_klass, gpointer class_data)
       "Insert Closed Captions",
       "Insert CEA-708 Closed Captions",
       TRUE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
+
+  /**
+   * GstVaH264Enc:skip-repeats:
+   *
+   * Code an input that shares its memory with the previous input as a
+   * non-reference picture of skipped macroblocks, built on the CPU
+   * instead of encoded by the hardware. Upstream elements that repeat a
+   * frame by reference (videorate, a compositor with unchanged inputs)
+   * then cost no encoder time for the repeat. Only without B frames.
+   *
+   * Since: 1.30
+   */
+  properties[PROP_SKIP_REPEATS] = g_param_spec_boolean ("skip-repeats",
+      "Skip repeated frames",
+      "Code repeated input frames as skip pictures without the hardware",
+      FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
 
   /**
    * GstVaH264Enc:mbbrc:

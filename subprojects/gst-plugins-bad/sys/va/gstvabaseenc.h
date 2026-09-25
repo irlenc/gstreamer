@@ -43,6 +43,9 @@ typedef struct _GstVaBaseEncPrivate GstVaBaseEncPrivate;
 struct _GstVaEncFrame
 {
   GstVaEncodePicture *picture;
+  /* The input shares its memory with the previous input, so the
+   * picture repeats the previous one exactly. */
+  gboolean repeat;
 };
 
 struct _GstVaBaseEnc
