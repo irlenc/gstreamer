@@ -1613,7 +1613,7 @@ gst_va_h264_enc_reconfig_rate_control (GstVaBaseEnc * base)
     gst_va_rate_control_set_bitrate (&self->app_rate_control,
         self->rc.target_bitrate_bits, self->rc.cpb_length_bits);
     gst_va_rate_control_set_qp_range (&self->app_rate_control,
-        self->rc.min_qp, self->rc.max_qp);
+        MAX (self->rc.min_qp, APP_RC_MIN_QP), self->rc.max_qp);
     return TRUE;
   }
 
