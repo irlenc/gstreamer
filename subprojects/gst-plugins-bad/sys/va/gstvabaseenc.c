@@ -1247,6 +1247,82 @@ gst_va_base_enc_add_quality_level_parameter (GstVaBaseEnc * base,
   return TRUE;
 }
 
+static guint
+_count_bits (guint64 v)
+{
+  guint n = 0;
+
+  for (; v; v &= v - 1)
+    n++;
+
+  return n;
+}
+
+/* The hardware rate control never sees a skip picture, so with half the
+ * input repeated it would still budget each coded frame for the full
+ * input rate and code the stream at half its bitrate, starving exactly
+ * the frames that carry the picture. Budget for the rate actually coded:
+ * the input rate divided by a small integer measured over the last
+ * second or so. A divisor that is too high lets the coded frames
+ * overshoot, so going back towards the full rate reacts within a few
+ * frames, while going the other way waits for a full window. Every change
+ * resets the driver's BRC (bResetBRC), hence the coarse steps and a fresh
+ * window after each one. */
+#define SKIP_WINDOW 60
+#define SKIP_ATTACK_WINDOW 8
+#define MAX_FPS_DIVISOR 4
+
+void
+gst_va_coded_rate_reset (GstVaCodedRate * rate)
+{
+  rate->history = 0;
+  rate->history_len = 0;
+  rate->divisor = 1;
+}
+
+/**
+ * gst_va_coded_rate_push:
+ * @rate: the tracker
+ * @skipped: whether the frame was coded as a skip picture
+ *
+ * Records one frame and recomputes the divisor of the input rate the
+ * rate control should budget for.
+ *
+ * Returns: %TRUE when the divisor changed and the new frame rate has to
+ * reach the driver.
+ */
+gboolean
+gst_va_coded_rate_push (GstVaCodedRate * rate, gboolean skipped)
+{
+  guint64 window_mask = (G_GUINT64_CONSTANT (1) << SKIP_WINDOW) - 1;
+  guint64 attack_mask = (G_GUINT64_CONSTANT (1) << SKIP_ATTACK_WINDOW) - 1;
+  guint coded, divisor = rate->divisor;
+
+  rate->history = (rate->history << 1) | (skipped ? 1 : 0);
+  if (rate->history_len < 64)
+    rate->history_len++;
+
+  if (divisor > 1 && rate->history_len >= SKIP_ATTACK_WINDOW
+      && _count_bits (rate->history & attack_mask) * divisor <
+      (divisor - 1) * SKIP_ATTACK_WINDOW / 2) {
+    /* Far fewer repeats lately than the divisor assumes. */
+    divisor = 1;
+  } else if (rate->history_len >= SKIP_WINDOW) {
+    coded = SKIP_WINDOW - _count_bits (rate->history & window_mask);
+    divisor = coded ? (SKIP_WINDOW + coded / 2) / coded : MAX_FPS_DIVISOR;
+    divisor = CLAMP (divisor, 1, MAX_FPS_DIVISOR);
+  }
+
+  if (divisor == rate->divisor)
+    return FALSE;
+
+  rate->divisor = divisor;
+  /* Judge the new budget on frames coded under it only, or the window
+   * that just triggered the change would undo it. */
+  rate->history_len = 0;
+  return TRUE;
+}
+
 gboolean
 gst_va_base_enc_add_frame_rate_parameter (GstVaBaseEnc * base,
     GstVaEncodePicture * picture)

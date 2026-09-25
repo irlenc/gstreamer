@@ -40,6 +40,15 @@ typedef struct _GstVaBaseEnc GstVaBaseEnc;
 typedef struct _GstVaBaseEncClass GstVaBaseEncClass;
 typedef struct _GstVaBaseEncPrivate GstVaBaseEncPrivate;
 
+/* Which recent frames an encoder coded as skip pictures, and the divisor
+ * of the input rate its rate control budgets for. */
+typedef struct
+{
+  guint64 history;
+  guint history_len;
+  guint divisor;
+} GstVaCodedRate;
+
 struct _GstVaEncFrame
 {
   GstVaEncodePicture *picture;
@@ -145,6 +154,9 @@ gboolean              gst_va_base_enc_add_quality_level_parameter (GstVaBaseEnc 
                                                                    guint target_usage);
 gboolean              gst_va_base_enc_add_frame_rate_parameter (GstVaBaseEnc * base,
                                                                 GstVaEncodePicture * picture);
+void                  gst_va_coded_rate_reset             (GstVaCodedRate * rate);
+gboolean              gst_va_coded_rate_push              (GstVaCodedRate * rate,
+                                                           gboolean skipped);
 gboolean              gst_va_base_enc_add_frame_rate_parameter_divided (GstVaBaseEnc * base,
                                                                         GstVaEncodePicture * picture,
                                                                         guint divisor);

@@ -294,12 +294,8 @@ struct _GstVaH264Enc
   /* Consecutive repeats coded as skip pictures since the last coded
    * picture. */
   guint skip_run;
-  /* One bit per recent frame, newest in bit 0, set for a skip picture,
-   * and how many of the 64 bits hold decisions. */
-  guint64 skip_history;
-  guint skip_history_len;
-  /* The rate control budgets for the input rate divided by this. */
-  guint rc_fps_divisor;
+  /* The rate control budgets for coded_rate.divisor of the input rate. */
+  GstVaCodedRate coded_rate;
   gboolean rc_fps_update;
   /* The PPS of the stream, as the last coded picture wrote it. A skip
    * picture refers to it. */
@@ -1607,9 +1603,7 @@ gst_va_h264_enc_reset_state (GstVaBaseEnc * base)
   self->skip_repeats = self->prop.skip_repeats;
   self->skip_run = 0;
   self->skip_pps_valid = FALSE;
-  self->skip_history = 0;
-  self->skip_history_len = 0;
-  self->rc_fps_divisor = 1;
+  gst_va_coded_rate_reset (&self->coded_rate);
   self->rc_fps_update = FALSE;
 
   memset (&self->sequence_hdr, 0, sizeof (GstH264SPS));
@@ -1782,65 +1776,19 @@ frame_setup_from_gop (GstVaH264Enc * self, GstVaH264EncFrame * frame, guint i)
  * source. */
 #define MAX_SKIP_RUN 8
 
-static guint
-_count_bits (guint64 v)
-{
-  guint n = 0;
-
-  for (; v; v &= v - 1)
-    n++;
-
-  return n;
-}
-
-/* The hardware rate control never sees a skip picture, so with half the
- * input repeated it would still budget each coded frame for the full
- * input rate and code the stream at half its bitrate, starving exactly
- * the frames that carry the picture. Budget for the rate actually coded:
- * the input rate divided by a small integer measured over the last
- * second or so. A divisor that is too high lets the coded frames
- * overshoot, so going back towards the full rate reacts within a few
- * frames, while going the other way waits for a full window. Every change
- * resets the driver's BRC (bResetBRC), hence the coarse steps and a fresh
- * window after each one. */
-#define SKIP_WINDOW 60
-#define SKIP_ATTACK_WINDOW 8
-#define MAX_FPS_DIVISOR 4
-
+/* See gst_va_coded_rate_push(): the hardware rate control never sees a
+ * skip picture, so it has to be told the rate actually coded. */
 static void
 _track_coded_rate (GstVaH264Enc * self, gboolean skipped)
 {
-  guint64 window_mask = (G_GUINT64_CONSTANT (1) << SKIP_WINDOW) - 1;
-  guint64 attack_mask = (G_GUINT64_CONSTANT (1) << SKIP_ATTACK_WINDOW) - 1;
-  guint coded, divisor = self->rc_fps_divisor;
-
   if (!self->skip_repeats)
     return;
 
-  self->skip_history = (self->skip_history << 1) | (skipped ? 1 : 0);
-  if (self->skip_history_len < 64)
-    self->skip_history_len++;
-
-  if (divisor > 1 && self->skip_history_len >= SKIP_ATTACK_WINDOW
-      && _count_bits (self->skip_history & attack_mask) * divisor <
-      (divisor - 1) * SKIP_ATTACK_WINDOW / 2) {
-    /* Far fewer repeats lately than the divisor assumes. */
-    divisor = 1;
-  } else if (self->skip_history_len >= SKIP_WINDOW) {
-    coded = SKIP_WINDOW - _count_bits (self->skip_history & window_mask);
-    divisor = coded ? (SKIP_WINDOW + coded / 2) / coded : MAX_FPS_DIVISOR;
-    divisor = CLAMP (divisor, 1, MAX_FPS_DIVISOR);
-  }
-
-  if (divisor != self->rc_fps_divisor) {
+  if (gst_va_coded_rate_push (&self->coded_rate, skipped)) {
     GST_INFO_OBJECT (self, "Rate control budgets for 1/%u of the input rate",
-        divisor);
-    self->rc_fps_divisor = divisor;
+        self->coded_rate.divisor);
     self->rc_fps_update = TRUE;
     self->rc_update_pending = TRUE;
-    /* Judge the new budget on frames coded under it only, or the window
-     * that just triggered the change would undo it. */
-    self->skip_history_len = 0;
   }
 }
 
@@ -3135,7 +3083,7 @@ _encode_one_frame (GstVaH264Enc * self, GstVideoCodecFrame * gst_frame)
       return FALSE;
 
     if (self->rc_fps_update && !gst_va_base_enc_add_frame_rate_parameter_divided
-        (base, frame->base.picture, self->rc_fps_divisor))
+        (base, frame->base.picture, self->coded_rate.divisor))
       return FALSE;
 
     if (!gst_va_base_enc_add_hrd_parameter (base, frame->base.picture,
@@ -3160,7 +3108,7 @@ _encode_one_frame (GstVaH264Enc * self, GstVideoCodecFrame * gst_frame)
       return FALSE;
 
     if (!gst_va_base_enc_add_frame_rate_parameter_divided (base,
-            frame->base.picture, self->rc_fps_divisor))
+            frame->base.picture, self->coded_rate.divisor))
       return FALSE;
 
     if (!gst_va_base_enc_add_hrd_parameter (base, frame->base.picture,
