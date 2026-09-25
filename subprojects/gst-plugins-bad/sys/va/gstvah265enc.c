@@ -63,6 +63,7 @@
 #endif
 
 #include "gstvah265enc.h"
+#include "gstvah265skip.h"
 
 #include <gst/codecparsers/gsth265bitwriter.h>
 #include <gst/va/gstva.h>
@@ -76,6 +77,7 @@
 #include "gstvaencoder.h"
 #include "gstvaprofile.h"
 #include "gstvapluginutils.h"
+#include "gstvaratecontrol.h"
 
 #include "gst/glib-compat-private.h"
 
@@ -113,6 +115,10 @@ enum
   PROP_AUD,
   PROP_NUM_TILE_COLS,
   PROP_NUM_TILE_ROWS,
+  PROP_SKIP_REPEATS,
+  PROP_APP_RATE_CONTROL,
+  /* Must stay last: class_init drops it when rate control is not
+   * supported. */
   PROP_RATE_CONTROL,
   N_PROPERTIES
 };
@@ -184,6 +190,8 @@ struct _GstVaH265Enc
     guint32 cpb_size;
     guint32 target_percentage;
     guint32 target_usage;
+    gboolean skip_repeats;
+    gboolean app_rc;
   } prop;
 
   /* H265 fields */
@@ -359,6 +367,28 @@ struct _GstVaH265Enc
 
   GstH265VPS vps_hdr;
   GstH265SPS sps_hdr;
+
+  /* The rate control was retuned without a reconfig and the next
+   * picture has to carry the new parameters. */
+  gboolean rc_update_pending;
+
+  gboolean skip_repeats;
+  /* Consecutive repeats coded as skip pictures since the last coded
+   * picture. */
+  guint skip_run;
+  /* The rate control budgets for coded_rate.divisor of the input rate. */
+  GstVaCodedRate coded_rate;
+  gboolean rc_fps_update;
+  /* The PPS of the stream, as the last I picture wrote it. A skip
+   * picture refers to it. */
+  GstH265PPS skip_pps;
+  gboolean skip_pps_valid;
+
+  /* The QP of every picture is chosen by app_rate_control and the
+   * driver runs in CQP mode, see gstvaratecontrol.c. rc.rc_ctrl_mode
+   * keeps the mode the stream is built for. */
+  gboolean app_rc;
+  GstVaRateControl app_rate_control;
 };
 
 struct _GstVaH265EncFrame
@@ -373,6 +403,14 @@ struct _GstVaH265EncFrame
 
   gint poc;
   gboolean last_frame;
+
+  /* Coded on the CPU as a picture of skipped coding units, never
+   * submitted to the hardware. */
+  gboolean is_skip;
+  GstBuffer *skip_buffer;
+
+  /* The application rate control decision for this picture. */
+  GstVaRcFrame rc;
 };
 
 /**
@@ -457,6 +495,10 @@ gst_va_h265_enc_frame_new (void)
   frame = g_new (GstVaH265EncFrame, 1);
   frame->last_frame = FALSE;
   frame->base.picture = NULL;
+  frame->base.repeat = FALSE;
+  frame->is_skip = FALSE;
+  frame->skip_buffer = NULL;
+  frame->rc.valid = FALSE;
 
   return frame;
 }
@@ -466,6 +508,7 @@ gst_va_h265_enc_frame_free (gpointer pframe)
 {
   GstVaH265EncFrame *frame = pframe;
   g_clear_pointer (&frame->base.picture, gst_va_encode_picture_free);
+  gst_clear_buffer (&frame->skip_buffer);
   g_free (frame);
 }
 
@@ -473,6 +516,14 @@ static inline GstVaH265EncFrame *
 _enc_frame (GstVideoCodecFrame * frame)
 {
   return gst_va_get_enc_frame (frame);
+}
+
+/* The rate control mode the driver runs, which differs from the mode of
+ * the stream when the application controls the rate. */
+static inline guint32
+_driver_rc_mode (GstVaH265Enc * self)
+{
+  return self->app_rc ? VA_RC_CQP : self->rc.rc_ctrl_mode;
 }
 
 static inline gboolean
@@ -1628,7 +1679,13 @@ _h265_fill_slice_parameter (GstVaH265Enc * self, GstVaH265EncFrame * frame,
   gint i;
 
   /* *INDENT-OFF* */
-  if (self->rc.rc_ctrl_mode == VA_RC_CQP) {
+  if (self->app_rc) {
+    /* The PPS keeps init_qp_minus26, so the QP of each picture changes
+     * without a new PPS. The packed slice segment header copies this
+     * delta, so the driver and the bitstream agree. */
+    slice_qp_delta = (int8_t) ((gint) frame->rc.qp - (gint) self->rc.qp_i);
+    g_assert (slice_qp_delta <= 51 && slice_qp_delta >= -51);
+  } else if (self->rc.rc_ctrl_mode == VA_RC_CQP) {
     if (frame->type == GST_H265_P_SLICE) {
       slice_qp_delta = self->rc.qp_p - self->rc.qp_i;
     } else if (frame->type == GST_H265_B_SLICE) {
@@ -1878,12 +1935,32 @@ _h265_encode_one_frame (GstVaH265Enc * self, GstVideoCodecFrame * gst_frame)
   if (self->aud && !_h265_add_aud (self, frame))
     return FALSE;
 
+  /* An IDR sends the whole sequence state below, so only a non IDR
+   * picture needs the retuned rate control on its own. */
+  if (self->rc_update_pending && frame->poc != 0) {
+    if (!gst_va_base_enc_add_rate_control_parameter (base, frame->base.picture,
+            _driver_rc_mode (self), self->rc.max_bitrate_bits,
+            self->rc.target_percentage, self->rc.qp_i, self->rc.min_qp,
+            self->rc.max_qp, self->rc.mbbrc))
+      return FALSE;
+
+    if (self->rc_fps_update && !gst_va_base_enc_add_frame_rate_parameter_divided
+        (base, frame->base.picture, self->coded_rate.divisor))
+      return FALSE;
+
+    if (!gst_va_base_enc_add_hrd_parameter (base, frame->base.picture,
+            _driver_rc_mode (self), self->rc.cpb_length_bits))
+      return FALSE;
+  }
+  self->rc_update_pending = FALSE;
+  self->rc_fps_update = FALSE;
+
   /* Repeat the VPS/SPS for IDR. */
   if (frame->poc == 0) {
     VAEncSequenceParameterBufferHEVC sequence;
 
     if (!gst_va_base_enc_add_rate_control_parameter (base, frame->base.picture,
-            self->rc.rc_ctrl_mode, self->rc.max_bitrate_bits,
+            _driver_rc_mode (self), self->rc.max_bitrate_bits,
             self->rc.target_percentage, self->rc.qp_i, self->rc.min_qp,
             self->rc.max_qp, self->rc.mbbrc))
       return FALSE;
@@ -1892,11 +1969,12 @@ _h265_encode_one_frame (GstVaH265Enc * self, GstVideoCodecFrame * gst_frame)
             self->rc.target_usage))
       return FALSE;
 
-    if (!gst_va_base_enc_add_frame_rate_parameter (base, frame->base.picture))
+    if (!gst_va_base_enc_add_frame_rate_parameter_divided (base,
+            frame->base.picture, self->coded_rate.divisor))
       return FALSE;
 
     if (!gst_va_base_enc_add_hrd_parameter (base, frame->base.picture,
-            self->rc.rc_ctrl_mode, self->rc.cpb_length_bits))
+            _driver_rc_mode (self), self->rc.cpb_length_bits))
       return FALSE;
 
     if (self->support_trellis && !gst_va_base_enc_add_trellis_parameter (base,
@@ -2001,6 +2079,23 @@ _h265_encode_one_frame (GstVaH265Enc * self, GstVideoCodecFrame * gst_frame)
 
   g_assert (list_forward_num + list_backward_num <= self->gop.max_dpb_size);
 
+  if (self->app_rc) {
+    GstVaRcFrameType type = GST_VA_RC_FRAME_P;
+
+    /* A low delay B picture is coded where the GOP puts a P picture and
+     * keeps the P type here, so it is controlled as one. */
+    if (frame->type == GST_H265_I_SLICE)
+      type = GST_VA_RC_FRAME_I;
+    else if (frame->type == GST_H265_B_SLICE)
+      type = GST_VA_RC_FRAME_B;
+
+    gst_va_rate_control_pick (&self->app_rate_control, type, &frame->rc);
+    GST_LOG_OBJECT (self, "Application rate control: poc %d type %d QP %u, "
+        "predicted %.0f bits, buffer %.0f of %.0f bits", frame->poc, type,
+        frame->rc.qp, frame->rc.predicted_bits,
+        self->app_rate_control.fullness, self->app_rate_control.buffer_size);
+  }
+
   if (!_h265_fill_picture_parameter (self, frame, &pic_param, collocated_poc))
     return FALSE;
   if (!_h265_add_picture_parameter (self, frame, &pic_param))
@@ -2009,9 +2104,16 @@ _h265_encode_one_frame (GstVaH265Enc * self, GstVideoCodecFrame * gst_frame)
   _h265_fill_pps (self, &pic_param, &self->sps_hdr, &pps);
 
   if ((self->packed_headers & VA_ENC_PACKED_HEADER_PICTURE)
-      && frame->type == GST_H265_I_SLICE
-      && !_h265_add_pps_header (self, frame, &pps))
-    return FALSE;
+      && frame->type == GST_H265_I_SLICE) {
+    if (!_h265_add_pps_header (self, frame, &pps))
+      return FALSE;
+
+    /* Only a PPS and SPS gstva wrote itself describe the stream. */
+    if (self->packed_headers & VA_ENC_PACKED_HEADER_SEQUENCE) {
+      self->skip_pps = pps;
+      self->skip_pps_valid = TRUE;
+    }
+  }
 
   if (!_h265_add_slices (self, frame, &pps,
           list_forward, list_forward_num, list_backward, list_backward_num,
@@ -2036,6 +2138,62 @@ frame_setup_from_gop (GstVaH265Enc * self, GstVaH265EncFrame * frame, guint i)
   frame->pyramid_level = self->gop.frame_types[i].pyramid_level;
   frame->left_ref_poc_diff = self->gop.frame_types[i].left_ref_poc_diff;
   frame->right_ref_poc_diff = self->gop.frame_types[i].right_ref_poc_diff;
+}
+
+/* A repeat can be a skip picture only where the GOP puts a P picture
+ * and nothing is reordered: the skip picture copies the most recent
+ * reference, which without B pictures is the last coded picture, and
+ * the repeat's content is by definition the same as that one's. The
+ * skip picture is a P slice even where the driver codes P pictures as
+ * low delay B: it is written on the CPU, so only the SPS and PPS bind
+ * it.
+ *
+ * A skip picture is a sub-layer non-reference picture, so it is never
+ * prevTid0Pic and the POC of a run of them is derived from the last
+ * reference (8.3.1). The run has to stay inside half the POC LSB range
+ * of that reference, and a long run on still content is broken by a
+ * coded picture now and then so the reference can keep converging on
+ * the source. */
+#define MAX_SKIP_RUN 8
+
+/* See gst_va_coded_rate_push(): the hardware rate control never sees a
+ * skip picture, so it has to be told the rate actually coded. */
+static void
+_track_coded_rate (GstVaH265Enc * self, gboolean skipped)
+{
+  if (!self->skip_repeats)
+    return;
+
+  if (gst_va_coded_rate_push (&self->coded_rate, skipped)) {
+    GST_INFO_OBJECT (self, "Rate control budgets for 1/%u of the input rate",
+        self->coded_rate.divisor);
+    if (self->app_rc) {
+      gst_va_rate_control_set_divisor (&self->app_rate_control,
+          self->coded_rate.divisor);
+    } else {
+      self->rc_fps_update = TRUE;
+      self->rc_update_pending = TRUE;
+    }
+  }
+}
+
+static void
+_decide_skip (GstVaH265Enc * self, GstVaH265EncFrame * frame)
+{
+  guint max_run = MIN (MAX_SKIP_RUN, self->gop.max_pic_order_cnt / 4 - 1);
+
+  if (self->skip_repeats && frame->base.repeat
+      && frame->type == GST_H265_P_SLICE && self->gop.num_bframes == 0
+      && self->skip_pps_valid && !_is_tile_enabled (self)
+      && !_is_scc_enabled (self) && self->skip_run < max_run) {
+    frame->is_skip = TRUE;
+    frame->is_ref = FALSE;
+    self->skip_run++;
+  } else {
+    self->skip_run = 0;
+  }
+
+  _track_coded_rate (self, frame->is_skip);
 }
 
 static gboolean
@@ -2100,6 +2258,7 @@ _h265_push_one_frame (GstVaBaseEnc * base, GstVideoCodecFrame * gst_frame,
       }
 
       frame_setup_from_gop (self, frame, self->gop.cur_frame_index);
+      _decide_skip (self, frame);
 
       GST_LOG_OBJECT (self, "Push frame, system_frame_number: %u, poc %d, "
           "frame type %s", gst_frame->system_frame_number, frame->poc,
@@ -2427,6 +2586,70 @@ _sort_by_poc (gconstpointer a, gconstpointer b, gpointer user_data)
   return frame1->poc - frame2->poc;
 }
 
+static gboolean
+_h265_encode_skip_frame (GstVaH265Enc * self, GstVaH265EncFrame * frame)
+{
+  GstVaBaseEnc *base = GST_VA_BASE_ENC (self);
+  GstH265SliceHdr slice_hdr = {
+    .pps = &self->skip_pps,
+    .pic_order_cnt_lsb = frame->poc,
+    .short_term_ref_pic_set_sps_flag = 0,
+    .qp_delta = 0,
+  };
+  GstH265ShortTermRefPicSet *rps = &slice_hdr.short_term_ref_pic_sets;
+  GstBuffer *picture;
+  guint num_refs = 0;
+  gint i;
+
+  /* The reference picture set lists every reference gstva keeps, since
+   * the decoder drops what it leaves out. Only the most recent one,
+   * the picture the repeat copies, is used by the skip picture. */
+  for (i = g_queue_get_length (&base->ref_list) - 1; i >= 0; i--) {
+    GstVaH265EncFrame *ref = _enc_frame (g_queue_peek_nth (&base->ref_list,
+            i));
+
+    g_assert (ref->poc < frame->poc);
+    g_assert (num_refs < G_N_ELEMENTS (rps->DeltaPocS0));
+
+    rps->DeltaPocS0[num_refs] = ref->poc - frame->poc;
+    rps->UsedByCurrPicS0[num_refs] = (num_refs == 0);
+    num_refs++;
+  }
+  rps->NumNegativePics = num_refs;
+  rps->NumDeltaPocs = num_refs;
+
+  picture = gst_va_h265_skip_picture_new (&slice_hdr);
+  if (!picture) {
+    GST_ERROR_OBJECT (self, "Failed to build the skip picture");
+    return FALSE;
+  }
+
+  if (self->aud) {
+    guint8 aud_data[8] = { 0, };
+    guint size = sizeof (aud_data);
+
+    /* pic_type 1: I or P slices */
+    if (gst_h265_bit_writer_aud (1, TRUE, aud_data, &size) !=
+        GST_H265_BIT_WRITER_OK) {
+      gst_buffer_unref (picture);
+      return FALSE;
+    }
+    picture = gst_buffer_append (gst_buffer_new_memdup (aud_data, size),
+        picture);
+  }
+
+  GST_LOG_OBJECT (self, "Repeat coded as a skip picture, poc %d, %u refs",
+      frame->poc, num_refs);
+
+  if (self->app_rc) {
+    gst_va_rate_control_skip (&self->app_rate_control,
+        gst_buffer_get_size (picture) * 8);
+  }
+
+  frame->skip_buffer = picture;
+  return TRUE;
+}
+
 static GstFlowReturn
 gst_va_h265_enc_encode_frame (GstVaBaseEnc * base,
     GstVideoCodecFrame * gst_frame, gboolean is_last)
@@ -2437,6 +2660,15 @@ gst_va_h265_enc_encode_frame (GstVaBaseEnc * base,
 
   frame = _enc_frame (gst_frame);
   frame->last_frame = is_last;
+
+  if (frame->is_skip) {
+    if (!_h265_encode_skip_frame (self, frame))
+      return GST_FLOW_ERROR;
+
+    g_queue_push_tail (&base->output_list,
+        gst_video_codec_frame_ref (gst_frame));
+    return GST_FLOW_OK;
+  }
 
   g_assert (frame->base.picture == NULL);
   frame->base.picture = gst_va_encode_picture_new (base->encoder,
@@ -2505,6 +2737,8 @@ gst_va_h265_enc_reset_state (GstVaBaseEnc * base)
   self->rc.target_percentage = self->prop.target_percentage;
   self->rc.target_usage = self->prop.target_usage;
   self->rc.cpb_size = self->prop.cpb_size;
+  self->skip_repeats = self->prop.skip_repeats;
+  self->app_rc = self->prop.app_rc;
   GST_OBJECT_UNLOCK (self);
 
   self->level_idc = 0;
@@ -2592,6 +2826,12 @@ gst_va_h265_enc_reset_state (GstVaBaseEnc * base)
   self->rc.max_bitrate_bits = 0;
   self->rc.target_bitrate_bits = 0;
   self->rc.cpb_length_bits = 0;
+  self->rc_update_pending = FALSE;
+
+  self->skip_run = 0;
+  self->skip_pps_valid = FALSE;
+  gst_va_coded_rate_reset (&self->coded_rate);
+  self->rc_fps_update = FALSE;
 
   memset (&self->vps_hdr, 0, sizeof (GstH265VPS));
   memset (&self->sps_hdr, 0, sizeof (GstH265SPS));
@@ -3488,6 +3728,71 @@ _h265_ensure_rate_control (GstVaH265Enc * self)
   return TRUE;
 }
 
+/* The application can only control the rate towards a bitrate, and
+ * only when the driver takes the QP from the slices, in CQP mode. This
+ * runs before _h265_ensure_rate_control() has validated the mode, so it
+ * also needs the driver to support the mode of the stream: that keeps
+ * the mode from falling back to another one after the VA config is
+ * created in CQP mode. */
+static void
+_h265_ensure_app_rate_control (GstVaH265Enc * self)
+{
+  GstVaBaseEnc *base = GST_VA_BASE_ENC (self);
+  guint32 rc_modes;
+
+  if (!self->app_rc)
+    return;
+
+  if (self->rc.rc_ctrl_mode != VA_RC_CBR && self->rc.rc_ctrl_mode != VA_RC_VBR) {
+    GST_INFO_OBJECT (self, "Application rate control needs the cbr or vbr "
+        "rate control mode, not used");
+    self->app_rc = FALSE;
+    return;
+  }
+
+  rc_modes = gst_va_display_get_rate_control_mode (base->display,
+      base->profile, GST_VA_BASE_ENC_ENTRYPOINT (base));
+  if (!(rc_modes & VA_RC_CQP) || !(rc_modes & self->rc.rc_ctrl_mode)) {
+    GST_WARNING_OBJECT (self, "The driver has no CQP or no %s mode, "
+        "application rate control disabled",
+        _rate_control_get_name (self->rc.rc_ctrl_mode));
+    self->app_rc = FALSE;
+    update_property_bool (base, &self->prop.app_rc, FALSE,
+        PROP_APP_RATE_CONTROL);
+  }
+}
+
+/* Below this QP an easy picture (static, or moving in exact pixel steps)
+ * costs no more bits, so a controller chasing a bitrate it cannot spend
+ * walks the QP down to the floor, and a hard scene after it then takes
+ * many pictures of bounded QP steps to climb back. Live streams gain
+ * nothing from a lower QP. The driver's own CBR fills the gap with
+ * filler data instead; this rate control leaves the bits unspent. */
+#define APP_RC_MIN_QP 12
+
+static void
+_h265_init_app_rate_control (GstVaH265Enc * self)
+{
+  GstVaBaseEnc *base = GST_VA_BASE_ENC (self);
+
+  if (!self->app_rc)
+    return;
+
+  /* A VBR stream is controlled to its target bitrate as CBR. */
+  gst_va_rate_control_init (&self->app_rate_control,
+      self->rc.target_bitrate_bits, GST_VIDEO_INFO_FPS_N (&base->in_info),
+      GST_VIDEO_INFO_FPS_D (&base->in_info), self->rc.cpb_length_bits,
+      self->gop.i_period > 0 ? self->gop.i_period : self->gop.idr_period,
+      MAX (self->rc.min_qp, APP_RC_MIN_QP), self->rc.max_qp,
+      self->luma_width * self->luma_height);
+  gst_va_rate_control_set_divisor (&self->app_rate_control,
+      self->coded_rate.divisor);
+
+  GST_INFO_OBJECT (self, "Application rate control: %u bits/s, buffer %.0f "
+      "bits, initial QP %u", self->rc.target_bitrate_bits,
+      self->app_rate_control.buffer_size, self->app_rate_control.initial_qp);
+}
+
 /* Derives the level and tier from the currently set limits */
 static gboolean
 _h265_calculate_tier_level (GstVaH265Enc * self)
@@ -4236,7 +4541,9 @@ _h265_setup_encoding_features (GstVaH265Enc * self)
   self->features.transform_skip_enabled_flag =
       (features.bits.transform_skip != 0);
 
-  if (self->rc.rc_ctrl_mode != VA_RC_CQP)
+  /* The CU QP delta serves the driver's rate control, which the
+   * application rate control replaces. */
+  if (_driver_rc_mode (self) != VA_RC_CQP)
     self->features.cu_qp_delta_enabled_flag = !!features.bits.cu_qp_delta;
   else
     self->features.cu_qp_delta_enabled_flag = 0;
@@ -4280,7 +4587,7 @@ default_options:
   self->features.constrained_intra_pred_flag = FALSE;
   self->features.transform_skip_enabled_flag = TRUE;
   self->features.cu_qp_delta_enabled_flag =
-      (self->rc.rc_ctrl_mode != VA_RC_CQP);
+      (_driver_rc_mode (self) != VA_RC_CQP);
   self->features.diff_cu_qp_delta_depth = 0;
   self->features.weighted_pred_flag = FALSE;
   self->features.weighted_bipred_flag = FALSE;
@@ -4496,6 +4803,79 @@ done:
       self->features.max_transform_hierarchy_depth_intra);
 }
 
+/* Retunes the bitrate of a running encoder. The driver resets its
+ * BRC when the rate control parameters change on a non IDR picture
+ * (media-driver sets bResetBRC), so a live bitrate change does not
+ * have to reopen the encoder and start a new GOP. A change of level,
+ * tier or rate control mode still takes the full reconfig. The VPS
+ * and SPS HRD carry the new bitrate from the next IDR on, exactly as
+ * they would after a full reconfig. */
+static gboolean
+gst_va_h265_enc_reconfig_rate_control (GstVaBaseEnc * base)
+{
+  GstVaH265Enc *self = GST_VA_H265_ENC (base);
+  guint8 level_idc = self->level_idc;
+  gboolean tier_flag = self->tier_flag;
+  guint32 rc_ctrl_mode = self->rc.rc_ctrl_mode;
+
+  if (!base->encoder || !gst_va_encoder_is_open (base->encoder))
+    return FALSE;
+
+  switch (rc_ctrl_mode) {
+    case VA_RC_CBR:
+    case VA_RC_VBR:
+    case VA_RC_VCM:
+    case VA_RC_QVBR:
+      break;
+    default:
+      return FALSE;
+  }
+
+  GST_OBJECT_LOCK (self);
+  self->rc.rc_ctrl_mode = self->prop.rc_ctrl;
+  self->rc.min_qp = self->prop.min_qp;
+  self->rc.max_qp = self->prop.max_qp;
+  self->rc.qp_i = self->prop.qp_i;
+  self->rc.qp_p = self->prop.qp_p;
+  self->rc.qp_b = self->prop.qp_b;
+  self->rc.mbbrc = self->prop.mbbrc;
+  self->rc.target_percentage = self->prop.target_percentage;
+  self->rc.target_usage = self->prop.target_usage;
+  self->rc.cpb_size = self->prop.cpb_size;
+  GST_OBJECT_UNLOCK (self);
+
+  self->rc.max_bitrate = 0;
+  self->rc.target_bitrate = 0;
+  self->rc.max_bitrate_bits = 0;
+  self->rc.target_bitrate_bits = 0;
+  self->rc.cpb_length_bits = 0;
+
+  if (!_h265_ensure_rate_control (self))
+    return FALSE;
+
+  if (self->rc.rc_ctrl_mode != rc_ctrl_mode)
+    return FALSE;
+
+  if (!_h265_calculate_tier_level (self) || self->level_idc != level_idc
+      || self->tier_flag != tier_flag)
+    return FALSE;
+
+  GST_INFO_OBJECT (self, "Rate control retuned in place: max bitrate %u, "
+      "target bitrate %u kbps", self->rc.max_bitrate, self->rc.target_bitrate);
+
+  /* The driver runs CQP and has no rate control to retune. */
+  if (self->app_rc) {
+    gst_va_rate_control_set_bitrate (&self->app_rate_control,
+        self->rc.target_bitrate_bits, self->rc.cpb_length_bits);
+    gst_va_rate_control_set_qp_range (&self->app_rate_control,
+        MAX (self->rc.min_qp, APP_RC_MIN_QP), self->rc.max_qp);
+    return TRUE;
+  }
+
+  self->rc_update_pending = TRUE;
+  return TRUE;
+}
+
 static gboolean
 gst_va_h265_enc_reconfig (GstVaBaseEnc * base)
 {
@@ -4537,8 +4917,12 @@ gst_va_h265_enc_reconfig (GstVaBaseEnc * base)
   if (!_h265_init_packed_headers (self))
     return FALSE;
 
+  /* The VA config fixes the driver's rate control mode, so whether the
+   * application controls the rate is decided before it. */
+  _h265_ensure_app_rate_control (self);
+
   if (!gst_va_encoder_setup (base->encoder, base->profile, base->rt_format,
-          self->rc.rc_ctrl_mode, self->packed_headers))
+          _driver_rc_mode (self), self->packed_headers))
     return FALSE;
 
   alignment = gst_va_encoder_get_surface_alignment (base->encoder);
@@ -4620,6 +5004,8 @@ gst_va_h265_enc_reconfig (GstVaBaseEnc * base)
   _h265_setup_encoding_features (self);
 
   _h265_calculate_coded_size (self);
+
+  _h265_init_app_rate_control (self);
 
   if (!_h265_setup_slice_and_tile_partition (self))
     return FALSE;
@@ -4738,6 +5124,7 @@ static gboolean
 gst_va_h265_enc_prepare_output (GstVaBaseEnc * base,
     GstVideoCodecFrame * frame, gboolean * complete)
 {
+  GstVaH265Enc *self = GST_VA_H265_ENC (base);
   GstVaH265EncFrame *frame_enc;
   GstBuffer *buf;
 
@@ -4753,11 +5140,30 @@ gst_va_h265_enc_prepare_output (GstVaBaseEnc * base,
     frame->dts = frame->pts;
   }
 
-  buf = gst_va_base_enc_create_output_buffer (base,
-      frame_enc->base.picture, NULL, 0);
+  if (frame_enc->skip_buffer) {
+    buf = g_steal_pointer (&frame_enc->skip_buffer);
+  } else {
+    buf = gst_va_base_enc_create_output_buffer (base,
+        frame_enc->base.picture, NULL, 0);
+  }
   if (!buf) {
     GST_ERROR_OBJECT (base, "Failed to create output buffer");
     return FALSE;
+  }
+
+  /* The coded size of every picture, with the headers the stream
+   * carries for it. Live, the output delay is 0 and this runs before
+   * the next picture is decided; otherwise the controller has counted
+   * the pictures in flight at their predicted size. */
+  if (self->app_rc && frame_enc->rc.valid) {
+    gsize size = gst_buffer_get_size (buf);
+
+    gst_va_rate_control_update (&self->app_rate_control, &frame_enc->rc,
+        (guint) MIN (size * 8, G_MAXUINT));
+    GST_LOG_OBJECT (self, "Application rate control: poc %d QP %u coded "
+        "%" G_GSIZE_FORMAT " bits, predicted %.0f", frame_enc->poc,
+        frame_enc->rc.qp, size * 8, frame_enc->rc.predicted_bits);
+    frame_enc->rc.valid = FALSE;
   }
 
   GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_MARKER);
@@ -4819,6 +5225,8 @@ gst_va_h265_enc_init (GTypeInstance * instance, gpointer g_class)
   self->prop.target_percentage = 66;
   self->prop.target_usage = 4;
   self->prop.cpb_size = 0;
+  self->prop.skip_repeats = FALSE;
+  self->prop.app_rc = FALSE;
   if (properties[PROP_RATE_CONTROL]) {
     self->prop.rc_ctrl =
         G_PARAM_SPEC_ENUM (properties[PROP_RATE_CONTROL])->default_value;
@@ -4911,12 +5319,12 @@ gst_va_h265_enc_set_property (GObject * object, guint prop_id,
     case PROP_BITRATE:
       self->prop.bitrate = g_value_get_uint (value);
       no_effect = FALSE;
-      g_atomic_int_set (&GST_VA_BASE_ENC (self)->reconf, TRUE);
+      g_atomic_int_set (&GST_VA_BASE_ENC (self)->rc_reconf, TRUE);
       break;
     case PROP_TARGET_PERCENTAGE:
       self->prop.target_percentage = g_value_get_uint (value);
       no_effect = FALSE;
-      g_atomic_int_set (&GST_VA_BASE_ENC (self)->reconf, TRUE);
+      g_atomic_int_set (&GST_VA_BASE_ENC (self)->rc_reconf, TRUE);
       break;
     case PROP_TARGET_USAGE:
       self->prop.target_usage = g_value_get_uint (value);
@@ -4928,6 +5336,14 @@ gst_va_h265_enc_set_property (GObject * object, guint prop_id,
       break;
     case PROP_NUM_TILE_ROWS:
       self->prop.num_tile_rows = g_value_get_uint (value);
+      break;
+    case PROP_SKIP_REPEATS:
+      self->prop.skip_repeats = g_value_get_boolean (value);
+      break;
+    case PROP_APP_RATE_CONTROL:
+      self->prop.app_rc = g_value_get_boolean (value);
+      no_effect = FALSE;
+      g_atomic_int_set (&GST_VA_BASE_ENC (self)->reconf, TRUE);
       break;
     case PROP_RATE_CONTROL:
       self->prop.rc_ctrl = g_value_get_enum (value);
@@ -5040,6 +5456,12 @@ gst_va_h265_enc_get_property (GObject * object, guint prop_id,
     case PROP_NUM_TILE_ROWS:
       g_value_set_uint (value, self->prop.num_tile_rows);
       break;
+    case PROP_SKIP_REPEATS:
+      g_value_set_boolean (value, self->prop.skip_repeats);
+      break;
+    case PROP_APP_RATE_CONTROL:
+      g_value_set_boolean (value, self->prop.app_rc);
+      break;
     case PROP_RATE_CONTROL:
       g_value_set_enum (value, self->prop.rc_ctrl);
       break;
@@ -5133,6 +5555,8 @@ gst_va_h265_enc_class_init (gpointer g_klass, gpointer class_data)
 
   va_enc_class->reset_state = GST_DEBUG_FUNCPTR (gst_va_h265_enc_reset_state);
   va_enc_class->reconfig = GST_DEBUG_FUNCPTR (gst_va_h265_enc_reconfig);
+  va_enc_class->reconfig_rate_control =
+      GST_DEBUG_FUNCPTR (gst_va_h265_enc_reconfig_rate_control);
   va_enc_class->new_frame = GST_DEBUG_FUNCPTR (gst_va_h265_enc_new_frame);
   va_enc_class->reorder_frame =
       GST_DEBUG_FUNCPTR (gst_va_h265_enc_reorder_frame);
@@ -5371,6 +5795,39 @@ gst_va_h265_enc_class_init (gpointer g_klass, gpointer class_data)
   properties[PROP_NUM_TILE_ROWS] = g_param_spec_uint ("num-tile-rows",
       "number of tile rows", "The number of rows for tile encoding",
       1, MAX_ROW_TILES, 1, param_flags);
+
+  /**
+   * GstVaH265Enc:skip-repeats:
+   *
+   * Code an input that shares its memory with the previous input as a
+   * non-reference picture of skipped coding units, built on the CPU
+   * instead of encoded by the hardware. Upstream elements that repeat a
+   * frame by reference (videorate, a compositor with unchanged inputs)
+   * then cost no encoder time for the repeat. Only without B frames and
+   * without tiles.
+   *
+   * Since: 1.30
+   */
+  properties[PROP_SKIP_REPEATS] = g_param_spec_boolean ("skip-repeats",
+      "Skip repeated frames",
+      "Code repeated input frames as skip pictures without the hardware",
+      FALSE, param_flags);
+
+  /**
+   * GstVaH265Enc:app-rate-control:
+   *
+   * Choose the QP of every picture in the element and run the driver in
+   * CQP mode, instead of the driver's rate control. Only with the cbr or
+   * vbr rate control, and vbr is then controlled to its target bitrate
+   * as cbr. On VDEnc the driver's rate control runs firmware on the
+   * video engine for every picture, which this avoids. Experimental.
+   *
+   * Since: 1.30
+   */
+  properties[PROP_APP_RATE_CONTROL] = g_param_spec_boolean ("app-rate-control",
+      "Application rate control",
+      "Control the bitrate in the element and encode in CQP mode",
+      FALSE, param_flags);
 
   if (vah265enc_class->rate_control_type > 0) {
     properties[PROP_RATE_CONTROL] = g_param_spec_enum ("rate-control",

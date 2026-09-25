@@ -71,6 +71,7 @@
 #endif
 
 #include "gstvah264enc.h"
+#include "gstvah264skip.h"
 
 #include <gst/codecparsers/gsth264bitwriter.h>
 #include <gst/va/gstva.h>
@@ -86,6 +87,7 @@
 #include "gstvaencoder.h"
 #include "gstvaprofile.h"
 #include "gstvapluginutils.h"
+#include "gstvaratecontrol.h"
 
 #include "gst/glib-compat-private.h"
 
@@ -122,6 +124,10 @@ enum
   PROP_CPB_SIZE,
   PROP_AUD,
   PROP_CC,
+  PROP_SKIP_REPEATS,
+  PROP_APP_RATE_CONTROL,
+  /* Must stay last: class_init drops it when rate control is not
+   * supported. */
   PROP_RATE_CONTROL,
   N_PROPERTIES
 };
@@ -186,6 +192,8 @@ struct _GstVaH264Enc
     guint32 cpb_size;
     guint32 target_percentage;
     guint32 target_usage;
+    gboolean skip_repeats;
+    gboolean app_rc;
   } prop;
 
   /* H264 fields */
@@ -280,6 +288,28 @@ struct _GstVaH264Enc
   } rc;
 
   GstH264SPS sequence_hdr;
+
+  /* The rate control was retuned without a reconfig and the next
+   * picture has to carry the new parameters. */
+  gboolean rc_update_pending;
+
+  gboolean skip_repeats;
+  /* Consecutive repeats coded as skip pictures since the last coded
+   * picture. */
+  guint skip_run;
+  /* The rate control budgets for coded_rate.divisor of the input rate. */
+  GstVaCodedRate coded_rate;
+  gboolean rc_fps_update;
+  /* The PPS of the stream, as the last coded picture wrote it. A skip
+   * picture refers to it. */
+  GstH264PPS skip_pps;
+  gboolean skip_pps_valid;
+
+  /* The QP of every picture is chosen by app_rate_control and the
+   * driver runs in CQP mode, see gstvaratecontrol.c. rc.rc_ctrl_mode
+   * keeps the mode the stream is built for. */
+  gboolean app_rc;
+  GstVaRateControl app_rate_control;
 };
 
 struct _GstVaH264EncFrame
@@ -300,6 +330,14 @@ struct _GstVaH264EncFrame
   gint unused_for_reference_pic_num;
 
   gboolean last_frame;
+
+  /* Coded on the CPU as a picture of skipped macroblocks, never
+   * submitted to the hardware. */
+  gboolean is_skip;
+  GstBuffer *skip_buffer;
+
+  /* The application rate control decision for this picture. */
+  GstVaRcFrame rc;
 };
 
 #ifndef GST_DISABLE_GST_DEBUG
@@ -332,7 +370,11 @@ gst_va_enc_frame_new (void)
   frame->frame_num = 0;
   frame->unused_for_reference_pic_num = -1;
   frame->base.picture = NULL;
+  frame->base.repeat = FALSE;
   frame->last_frame = FALSE;
+  frame->is_skip = FALSE;
+  frame->skip_buffer = NULL;
+  frame->rc.valid = FALSE;
 
   return frame;
 }
@@ -342,6 +384,7 @@ gst_va_enc_frame_free (gpointer pframe)
 {
   GstVaH264EncFrame *frame = pframe;
   g_clear_pointer (&frame->base.picture, gst_va_encode_picture_free);
+  gst_clear_buffer (&frame->skip_buffer);
   g_free (frame);
 }
 
@@ -349,6 +392,14 @@ static inline GstVaH264EncFrame *
 _enc_frame (GstVideoCodecFrame * frame)
 {
   return gst_va_get_enc_frame (frame);
+}
+
+/* The rate control mode the driver runs, which differs from the mode of
+ * the stream when the application controls the rate. */
+static inline guint32
+_driver_rc_mode (GstVaH264Enc * self)
+{
+  return self->app_rc ? VA_RC_CQP : self->rc.rc_ctrl_mode;
 }
 
 /* Normalizes bitrate (and CPB size) for HRD conformance */
@@ -634,6 +685,67 @@ _ensure_rate_control (GstVaH264Enc * self)
   update_property_uint (base, &self->prop.qp_b, self->rc.qp_b, PROP_QP_B);
 
   return TRUE;
+}
+
+/* The application can only control the rate towards a bitrate, and
+ * only when the driver takes the QP from the slices, in CQP mode. */
+static void
+_ensure_app_rate_control (GstVaH264Enc * self)
+{
+  GstVaBaseEnc *base = GST_VA_BASE_ENC (self);
+  guint32 rc_modes;
+
+  if (!self->app_rc)
+    return;
+
+  if ((self->rc.rc_ctrl_mode != VA_RC_CBR && self->rc.rc_ctrl_mode != VA_RC_VBR)
+      || self->rc.target_bitrate_bits == 0) {
+    GST_INFO_OBJECT (self, "Application rate control needs the cbr or vbr "
+        "rate control mode, not used");
+    self->app_rc = FALSE;
+    return;
+  }
+
+  rc_modes = gst_va_display_get_rate_control_mode (base->display,
+      base->profile, GST_VA_BASE_ENC_ENTRYPOINT (base));
+  if (!(rc_modes & VA_RC_CQP)) {
+    GST_WARNING_OBJECT (self, "The driver has no CQP mode, application "
+        "rate control disabled");
+    self->app_rc = FALSE;
+    update_property_bool (base, &self->prop.app_rc, FALSE,
+        PROP_APP_RATE_CONTROL);
+  }
+}
+
+/* Below this QP an easy picture (static, or moving in exact pixel steps)
+ * costs no more bits, so a controller chasing a bitrate it cannot spend
+ * walks the QP down to the floor, and a hard scene after it then takes
+ * many pictures of bounded QP steps to climb back. Live streams gain
+ * nothing from a lower QP. The driver's own CBR fills the gap with
+ * filler data instead; this rate control leaves the bits unspent. */
+#define APP_RC_MIN_QP 12
+
+static void
+_init_app_rate_control (GstVaH264Enc * self)
+{
+  GstVaBaseEnc *base = GST_VA_BASE_ENC (self);
+
+  if (!self->app_rc)
+    return;
+
+  /* A VBR stream is controlled to its target bitrate as CBR. */
+  gst_va_rate_control_init (&self->app_rate_control,
+      self->rc.target_bitrate_bits, GST_VIDEO_INFO_FPS_N (&base->in_info),
+      GST_VIDEO_INFO_FPS_D (&base->in_info), self->rc.cpb_length_bits,
+      self->gop.i_period > 0 ? self->gop.i_period : self->gop.idr_period,
+      MAX (self->rc.min_qp, APP_RC_MIN_QP), self->rc.max_qp,
+      self->mb_width * self->mb_height * 256);
+  gst_va_rate_control_set_divisor (&self->app_rate_control,
+      self->coded_rate.divisor);
+
+  GST_INFO_OBJECT (self, "Application rate control: %u bits/s, buffer %.0f "
+      "bits, initial QP %u", self->rc.target_bitrate_bits,
+      self->app_rate_control.buffer_size, self->app_rate_control.initial_qp);
 }
 
 /* Derives the level from the currently set limits */
@@ -1439,6 +1551,76 @@ out:
   return ret;
 }
 
+/* Retunes the bitrate of a running encoder. The driver resets its
+ * BRC when the rate control parameters change on a non IDR picture
+ * (media-driver sets bResetBRC), so a live bitrate change does not
+ * have to reopen the encoder and start a new GOP. Anything that would
+ * change the stream headers beyond the HRD, a new level or a new rate
+ * control mode, still takes the full reconfig. */
+static gboolean
+gst_va_h264_enc_reconfig_rate_control (GstVaBaseEnc * base)
+{
+  GstVaH264Enc *self = GST_VA_H264_ENC (base);
+  guint8 level_idc = self->level_idc;
+  guint32 rc_ctrl_mode = self->rc.rc_ctrl_mode;
+
+  if (!base->encoder || !gst_va_encoder_is_open (base->encoder))
+    return FALSE;
+
+  switch (rc_ctrl_mode) {
+    case VA_RC_CBR:
+    case VA_RC_VBR:
+    case VA_RC_VCM:
+    case VA_RC_QVBR:
+      break;
+    default:
+      return FALSE;
+  }
+
+  GST_OBJECT_LOCK (self);
+  self->rc.rc_ctrl_mode = self->prop.rc_ctrl;
+  self->rc.min_qp = self->prop.min_qp;
+  self->rc.max_qp = self->prop.max_qp;
+  self->rc.qp_i = self->prop.qp_i;
+  self->rc.qp_p = self->prop.qp_p;
+  self->rc.qp_b = self->prop.qp_b;
+  self->rc.mbbrc = self->prop.mbbrc;
+  self->rc.target_percentage = self->prop.target_percentage;
+  self->rc.target_usage = self->prop.target_usage;
+  self->rc.cpb_size = self->prop.cpb_size;
+  GST_OBJECT_UNLOCK (self);
+
+  self->rc.max_bitrate = 0;
+  self->rc.target_bitrate = 0;
+  self->rc.max_bitrate_bits = 0;
+  self->rc.target_bitrate_bits = 0;
+  self->rc.cpb_length_bits = 0;
+
+  if (!_ensure_rate_control (self))
+    return FALSE;
+
+  if (self->rc.rc_ctrl_mode != rc_ctrl_mode)
+    return FALSE;
+
+  if (!_calculate_level (self) || self->level_idc != level_idc)
+    return FALSE;
+
+  GST_INFO_OBJECT (self, "Rate control retuned in place: max bitrate %u, "
+      "target bitrate %u kbps", self->rc.max_bitrate, self->rc.target_bitrate);
+
+  /* The driver runs CQP and has no rate control to retune. */
+  if (self->app_rc) {
+    gst_va_rate_control_set_bitrate (&self->app_rate_control,
+        self->rc.target_bitrate_bits, self->rc.cpb_length_bits);
+    gst_va_rate_control_set_qp_range (&self->app_rate_control,
+        MAX (self->rc.min_qp, APP_RC_MIN_QP), self->rc.max_qp);
+    return TRUE;
+  }
+
+  self->rc_update_pending = TRUE;
+  return TRUE;
+}
+
 /* Clear all the info of last reconfig and set the fields based on
  * property. The reconfig may change these fields because of the
  * profile/level and HW limitation. */
@@ -1474,6 +1656,7 @@ gst_va_h264_enc_reset_state (GstVaBaseEnc * base)
   self->rc.target_percentage = self->prop.target_percentage;
   self->rc.target_usage = self->prop.target_usage;
   self->rc.cpb_size = self->prop.cpb_size;
+  self->app_rc = self->prop.app_rc;
   GST_OBJECT_UNLOCK (self);
 
   self->level_idc = 0;
@@ -1507,6 +1690,13 @@ gst_va_h264_enc_reset_state (GstVaBaseEnc * base)
   self->rc.max_bitrate_bits = 0;
   self->rc.target_bitrate_bits = 0;
   self->rc.cpb_length_bits = 0;
+  self->rc_update_pending = FALSE;
+
+  self->skip_repeats = self->prop.skip_repeats;
+  self->skip_run = 0;
+  self->skip_pps_valid = FALSE;
+  gst_va_coded_rate_reset (&self->coded_rate);
+  self->rc_fps_update = FALSE;
 
   memset (&self->sequence_hdr, 0, sizeof (GstH264SPS));
 }
@@ -1572,12 +1762,16 @@ gst_va_h264_enc_reconfig (GstVaBaseEnc * base)
   if (!_ensure_rate_control (self))
     return FALSE;
 
+  _ensure_app_rate_control (self);
+
   _generate_gop_structure (self);
 
   if (!_calculate_level (self))
     return FALSE;
 
   _calculate_coded_size (self);
+
+  _init_app_rate_control (self);
 
   if (!_init_packed_headers (self))
     return FALSE;
@@ -1607,7 +1801,7 @@ gst_va_h264_enc_reconfig (GstVaBaseEnc * base)
 
   if (!gst_va_encoder_open (base->encoder, base->profile,
           format, base->rt_format, base->width, base->height,
-          base->codedbuf_size, max_ref_frames, self->rc.rc_ctrl_mode,
+          base->codedbuf_size, max_ref_frames, _driver_rc_mode (self),
           self->packed_headers)) {
     GST_ERROR_OBJECT (self, "Failed to open the VA encoder.");
     return FALSE;
@@ -1663,6 +1857,62 @@ frame_setup_from_gop (GstVaH264Enc * self, GstVaH264EncFrame * frame, guint i)
   frame->pyramid_level = self->gop.frame_types[i].pyramid_level;
   frame->left_ref_poc_diff = self->gop.frame_types[i].left_ref_poc_diff;
   frame->right_ref_poc_diff = self->gop.frame_types[i].right_ref_poc_diff;
+}
+
+/* A repeat can be a skip picture only where the GOP puts a P picture
+ * and nothing is reordered: P_Skip copies the first picture of list 0,
+ * which without B pictures is the last coded one, and the repeat's
+ * content is by definition the same as that one's.
+ *
+ * A skip picture is not a reference, so it does not advance frame_num
+ * and the POC of a run of them is derived from the last reference
+ * (8.2.1.1). The run has to stay inside half the POC LSB range of that
+ * reference, and a long run on still content is broken by a coded
+ * picture now and then so the reference can keep converging on the
+ * source. */
+#define MAX_SKIP_RUN 8
+
+/* See gst_va_coded_rate_push(): the hardware rate control never sees a
+ * skip picture, so it has to be told the rate actually coded. */
+static void
+_track_coded_rate (GstVaH264Enc * self, gboolean skipped)
+{
+  if (!self->skip_repeats)
+    return;
+
+  if (gst_va_coded_rate_push (&self->coded_rate, skipped)) {
+    GST_INFO_OBJECT (self, "Rate control budgets for 1/%u of the input rate",
+        self->coded_rate.divisor);
+    if (self->app_rc) {
+      gst_va_rate_control_set_divisor (&self->app_rate_control,
+          self->coded_rate.divisor);
+    } else {
+      self->rc_fps_update = TRUE;
+      self->rc_update_pending = TRUE;
+    }
+  }
+}
+
+static void
+_decide_skip (GstVaH264Enc * self, GstVideoCodecFrame * gst_frame,
+    GstVaH264EncFrame * frame)
+{
+  guint max_run = MIN (MAX_SKIP_RUN, self->gop.max_pic_order_cnt / 4 - 1);
+  gboolean has_captions = self->cc && gst_buffer_get_meta
+      (gst_frame->input_buffer, GST_VIDEO_CAPTION_META_API_TYPE) != NULL;
+
+  if (self->skip_repeats && frame->base.repeat && !has_captions
+      && frame->type == GST_H264_P_SLICE && self->gop.num_bframes == 0
+      && self->skip_pps_valid && self->num_slices >= 1
+      && self->skip_run < max_run) {
+    frame->is_skip = TRUE;
+    frame->is_ref = FALSE;
+    self->skip_run++;
+  } else {
+    self->skip_run = 0;
+  }
+
+  _track_coded_rate (self, frame->is_skip);
 }
 
 static gboolean
@@ -1730,6 +1980,7 @@ _push_one_frame (GstVaBaseEnc * base, GstVideoCodecFrame * gst_frame,
       }
 
       frame_setup_from_gop (self, frame, self->gop.cur_frame_index);
+      _decide_skip (self, gst_frame, frame);
 
       GST_LOG_OBJECT (self, "Push frame, system_frame_number: %u, poc %d, "
           "frame type %s", gst_frame->system_frame_number, frame->poc,
@@ -2413,7 +2664,13 @@ _add_one_slice (GstVaH264Enc * self, GstVaH264EncFrame * frame,
   gint i;
 
   /* *INDENT-OFF* */
-  if (self->rc.rc_ctrl_mode == VA_RC_CQP) {
+  if (self->app_rc) {
+    /* The PPS keeps pic_init_qp, so the QP of each picture changes
+     * without new parameter sets. The packed slice header copies this
+     * delta, so the driver and the bitstream agree. */
+    slice_qp_delta = (int8_t) ((gint) frame->rc.qp - (gint) self->rc.qp_i);
+    g_assert (slice_qp_delta <= 51 && slice_qp_delta >= -51);
+  } else if (self->rc.rc_ctrl_mode == VA_RC_CQP) {
     if (frame->type == GST_H264_P_SLICE) {
       slice_qp_delta = self->rc.qp_p - self->rc.qp_i;
     } else if (frame->type == GST_H264_B_SLICE) {
@@ -2923,12 +3180,32 @@ _encode_one_frame (GstVaH264Enc * self, GstVideoCodecFrame * gst_frame)
   if (self->aud && !_add_aud (self, frame))
     return FALSE;
 
+  /* An IDR sends the whole sequence state below, so only a non IDR
+   * picture needs the retuned rate control on its own. */
+  if (self->rc_update_pending && frame->poc != 0) {
+    if (!gst_va_base_enc_add_rate_control_parameter (base, frame->base.picture,
+            _driver_rc_mode (self), self->rc.max_bitrate_bits,
+            self->rc.target_percentage, self->rc.qp_i, self->rc.min_qp,
+            self->rc.max_qp, self->rc.mbbrc))
+      return FALSE;
+
+    if (self->rc_fps_update && !gst_va_base_enc_add_frame_rate_parameter_divided
+        (base, frame->base.picture, self->coded_rate.divisor))
+      return FALSE;
+
+    if (!gst_va_base_enc_add_hrd_parameter (base, frame->base.picture,
+            _driver_rc_mode (self), self->rc.cpb_length_bits))
+      return FALSE;
+  }
+  self->rc_update_pending = FALSE;
+  self->rc_fps_update = FALSE;
+
   /* Repeat the SPS for IDR. */
   if (frame->poc == 0) {
     VAEncSequenceParameterBufferH264 sequence;
 
     if (!gst_va_base_enc_add_rate_control_parameter (base, frame->base.picture,
-            self->rc.rc_ctrl_mode, self->rc.max_bitrate_bits,
+            _driver_rc_mode (self), self->rc.max_bitrate_bits,
             self->rc.target_percentage, self->rc.qp_i, self->rc.min_qp,
             self->rc.max_qp, self->rc.mbbrc))
       return FALSE;
@@ -2937,11 +3214,12 @@ _encode_one_frame (GstVaH264Enc * self, GstVideoCodecFrame * gst_frame)
             self->rc.target_usage))
       return FALSE;
 
-    if (!gst_va_base_enc_add_frame_rate_parameter (base, frame->base.picture))
+    if (!gst_va_base_enc_add_frame_rate_parameter_divided (base,
+            frame->base.picture, self->coded_rate.divisor))
       return FALSE;
 
     if (!gst_va_base_enc_add_hrd_parameter (base, frame->base.picture,
-            self->rc.rc_ctrl_mode, self->rc.cpb_length_bits))
+            _driver_rc_mode (self), self->rc.cpb_length_bits))
       return FALSE;
 
     if (self->support_trellis && !gst_va_base_enc_add_trellis_parameter (base,
@@ -3009,11 +3287,28 @@ _encode_one_frame (GstVaH264Enc * self, GstVideoCodecFrame * gst_frame)
 
   g_assert (list0_num + list1_num <= self->gop.num_ref_frames);
 
+  if (self->app_rc) {
+    GstVaRcFrameType type = GST_VA_RC_FRAME_P;
+
+    if (frame->type == GST_H264_I_SLICE)
+      type = GST_VA_RC_FRAME_I;
+    else if (frame->type == GST_H264_B_SLICE)
+      type = GST_VA_RC_FRAME_B;
+
+    gst_va_rate_control_pick (&self->app_rate_control, type, &frame->rc);
+    GST_LOG_OBJECT (self, "Application rate control: poc %d type %d QP %u, "
+        "predicted %.0f bits, buffer %.0f of %.0f bits", frame->poc, type,
+        frame->rc.qp, frame->rc.predicted_bits,
+        self->app_rate_control.fullness, self->app_rate_control.buffer_size);
+  }
+
   if (!_fill_picture_parameter (self, frame, &pic_param))
     return FALSE;
   if (!_add_picture_parameter (self, frame, &pic_param))
     return FALSE;
   _fill_pps (&pic_param, &self->sequence_hdr, &pps);
+  self->skip_pps = pps;
+  self->skip_pps_valid = TRUE;
 
   if ((self->packed_headers & VA_ENC_PACKED_HEADER_PICTURE)
       && frame->type == GST_H264_I_SLICE
@@ -3076,6 +3371,7 @@ static gboolean
 gst_va_h264_enc_prepare_output (GstVaBaseEnc * base,
     GstVideoCodecFrame * frame, gboolean * complete)
 {
+  GstVaH264Enc *self = GST_VA_H264_ENC (base);
   GstVaH264EncFrame *frame_enc;
   GstBuffer *buf;
 
@@ -3091,11 +3387,30 @@ gst_va_h264_enc_prepare_output (GstVaBaseEnc * base,
     frame->dts = frame->pts;
   }
 
-  buf = gst_va_base_enc_create_output_buffer (base,
-      frame_enc->base.picture, NULL, 0);
+  if (frame_enc->skip_buffer) {
+    buf = g_steal_pointer (&frame_enc->skip_buffer);
+  } else {
+    buf = gst_va_base_enc_create_output_buffer (base,
+        frame_enc->base.picture, NULL, 0);
+  }
   if (!buf) {
     GST_ERROR_OBJECT (base, "Failed to create output buffer");
     return FALSE;
+  }
+
+  /* The coded size of every picture, with the headers the stream
+   * carries for it. Live, the output delay is 0 and this runs before
+   * the next picture is decided; otherwise the controller has counted
+   * the pictures in flight at their predicted size. */
+  if (self->app_rc && frame_enc->rc.valid) {
+    gsize size = gst_buffer_get_size (buf);
+
+    gst_va_rate_control_update (&self->app_rate_control, &frame_enc->rc,
+        (guint) MIN (size * 8, G_MAXUINT));
+    GST_LOG_OBJECT (self, "Application rate control: poc %d QP %u coded "
+        "%" G_GSIZE_FORMAT " bits, predicted %.0f", frame_enc->poc,
+        frame_enc->rc.qp, size * 8, frame_enc->rc.predicted_bits);
+    frame_enc->rc.valid = FALSE;
   }
 
   GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_MARKER);
@@ -3189,6 +3504,58 @@ _find_unused_reference_frame (GstVaH264Enc * self, GstVaH264EncFrame * frame)
   return b_frame;
 }
 
+static gboolean
+_encode_skip_frame (GstVaH264Enc * self, GstVaH264EncFrame * frame)
+{
+  GstH264SliceHdr slice_hdr = {
+    .first_mb_in_slice = 0,
+    .type = GST_H264_P_SLICE,
+    .pps = &self->skip_pps,
+    .frame_num = frame->frame_num,
+    .pic_order_cnt_lsb = frame->poc,
+    .num_ref_idx_active_override_flag = 1,
+    .num_ref_idx_l0_active_minus1 = 0,
+    .cabac_init_idc = 0,
+    .slice_qp_delta = 0,
+    /* No residual and zero motion leave nothing to filter. */
+    .disable_deblocking_filter_idc =
+        self->skip_pps.deblocking_filter_control_present_flag ? 1 : 0,
+  };
+  GstBuffer *picture;
+
+  picture = gst_va_h264_skip_picture_new (&slice_hdr,
+      self->mb_width * self->mb_height);
+  if (!picture) {
+    GST_ERROR_OBJECT (self, "Failed to build the skip picture");
+    return FALSE;
+  }
+
+  if (self->aud) {
+    guint8 aud_data[8] = { 0, };
+    guint size = sizeof (aud_data);
+
+    /* primary_pic_type 1: I or P slices */
+    if (gst_h264_bit_writer_aud (1, TRUE, aud_data, &size) !=
+        GST_H264_BIT_WRITER_OK) {
+      gst_buffer_unref (picture);
+      return FALSE;
+    }
+    picture = gst_buffer_append (gst_buffer_new_memdup (aud_data, size),
+        picture);
+  }
+
+  GST_LOG_OBJECT (self, "Repeat coded as a skip picture, poc %d, frame num %d",
+      frame->poc, frame->frame_num);
+
+  if (self->app_rc) {
+    gst_va_rate_control_skip (&self->app_rate_control,
+        gst_buffer_get_size (picture) * 8);
+  }
+
+  frame->skip_buffer = picture;
+  return TRUE;
+}
+
 static GstFlowReturn
 gst_va_h264_enc_encode_frame (GstVaBaseEnc * base,
     GstVideoCodecFrame * gst_frame, gboolean is_last)
@@ -3199,6 +3566,15 @@ gst_va_h264_enc_encode_frame (GstVaBaseEnc * base,
 
   frame = _enc_frame (gst_frame);
   frame->last_frame = is_last;
+
+  if (frame->is_skip) {
+    if (!_encode_skip_frame (self, frame))
+      return GST_FLOW_ERROR;
+
+    g_queue_push_tail (&base->output_list,
+        gst_video_codec_frame_ref (gst_frame));
+    return GST_FLOW_OK;
+  }
 
   g_assert (frame->base.picture == NULL);
   frame->base.picture = gst_va_encode_picture_new (base->encoder,
@@ -3303,6 +3679,8 @@ gst_va_h264_enc_init (GTypeInstance * instance, gpointer g_class)
   self->prop.use_trellis = FALSE;
   self->prop.aud = FALSE;
   self->prop.cc = TRUE;
+  self->prop.skip_repeats = FALSE;
+  self->prop.app_rc = FALSE;
   self->prop.mbbrc = 0;
   self->prop.bitrate = 0;
   self->prop.target_percentage = 66;
@@ -3387,6 +3765,14 @@ gst_va_h264_enc_set_property (GObject * object, guint prop_id,
     case PROP_CC:
       self->prop.cc = g_value_get_boolean (value);
       break;
+    case PROP_SKIP_REPEATS:
+      self->prop.skip_repeats = g_value_get_boolean (value);
+      break;
+    case PROP_APP_RATE_CONTROL:
+      self->prop.app_rc = g_value_get_boolean (value);
+      no_effect = FALSE;
+      g_atomic_int_set (&GST_VA_BASE_ENC (self)->reconf, TRUE);
+      break;
     case PROP_MBBRC:{
       /* Macroblock-level rate control.
        * 0: use default,
@@ -3409,12 +3795,12 @@ gst_va_h264_enc_set_property (GObject * object, guint prop_id,
     case PROP_BITRATE:
       self->prop.bitrate = g_value_get_uint (value);
       no_effect = FALSE;
-      g_atomic_int_set (&GST_VA_BASE_ENC (self)->reconf, TRUE);
+      g_atomic_int_set (&GST_VA_BASE_ENC (self)->rc_reconf, TRUE);
       break;
     case PROP_TARGET_PERCENTAGE:
       self->prop.target_percentage = g_value_get_uint (value);
       no_effect = FALSE;
-      g_atomic_int_set (&GST_VA_BASE_ENC (self)->reconf, TRUE);
+      g_atomic_int_set (&GST_VA_BASE_ENC (self)->rc_reconf, TRUE);
       break;
     case PROP_TARGET_USAGE:
       self->prop.target_usage = g_value_get_uint (value);
@@ -3501,6 +3887,12 @@ gst_va_h264_enc_get_property (GObject * object, guint prop_id,
       break;
     case PROP_CC:
       g_value_set_boolean (value, self->prop.cc);
+      break;
+    case PROP_SKIP_REPEATS:
+      g_value_set_boolean (value, self->prop.skip_repeats);
+      break;
+    case PROP_APP_RATE_CONTROL:
+      g_value_set_boolean (value, self->prop.app_rc);
       break;
     case PROP_MBBRC:{
       GstVaFeature mbbrc = GST_VA_FEATURE_AUTO;
@@ -3614,6 +4006,8 @@ gst_va_h264_enc_class_init (gpointer g_klass, gpointer class_data)
 
   va_enc_class->reset_state = GST_DEBUG_FUNCPTR (gst_va_h264_enc_reset_state);
   va_enc_class->reconfig = GST_DEBUG_FUNCPTR (gst_va_h264_enc_reconfig);
+  va_enc_class->reconfig_rate_control =
+      GST_DEBUG_FUNCPTR (gst_va_h264_enc_reconfig_rate_control);
   va_enc_class->new_frame = GST_DEBUG_FUNCPTR (gst_va_h264_enc_new_frame);
   va_enc_class->reorder_frame =
       GST_DEBUG_FUNCPTR (gst_va_h264_enc_reorder_frame);
@@ -3800,6 +4194,38 @@ gst_va_h264_enc_class_init (gpointer g_klass, gpointer class_data)
       "Insert Closed Captions",
       "Insert CEA-708 Closed Captions",
       TRUE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
+
+  /**
+   * GstVaH264Enc:skip-repeats:
+   *
+   * Code an input that shares its memory with the previous input as a
+   * non-reference picture of skipped macroblocks, built on the CPU
+   * instead of encoded by the hardware. Upstream elements that repeat a
+   * frame by reference (videorate, a compositor with unchanged inputs)
+   * then cost no encoder time for the repeat. Only without B frames.
+   *
+   * Since: 1.30
+   */
+  properties[PROP_SKIP_REPEATS] = g_param_spec_boolean ("skip-repeats",
+      "Skip repeated frames",
+      "Code repeated input frames as skip pictures without the hardware",
+      FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
+
+  /**
+   * GstVaH264Enc:app-rate-control:
+   *
+   * Choose the QP of every picture in the element and run the driver in
+   * CQP mode, instead of the driver's rate control. Only with the cbr or
+   * vbr rate control, and vbr is then controlled to its target bitrate
+   * as cbr. On VDEnc the driver's rate control runs firmware on the
+   * video engine for every picture, which this avoids. Experimental.
+   *
+   * Since: 1.30
+   */
+  properties[PROP_APP_RATE_CONTROL] = g_param_spec_boolean ("app-rate-control",
+      "Application rate control",
+      "Control the bitrate in the element and encode in CQP mode",
+      FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
 
   /**
    * GstVaH264Enc:mbbrc:

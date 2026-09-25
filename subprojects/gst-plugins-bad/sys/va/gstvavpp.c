@@ -129,6 +129,16 @@ struct _GstVaVpp
   gboolean pseudo_passthrough;
 
   GList *channels;
+
+  gboolean skip_unchanged;
+  /* Bumped whenever anything that shapes the output may have changed:
+   * properties, caps and rebuilt filters. */
+  guint generation;
+  /* The last processed input, held so its memory cannot be recycled
+   * into a different picture, and what it produced. */
+  GstBuffer *memo_in;
+  GstBuffer *memo_out;
+  guint memo_generation;
 };
 
 static GstElementClass *parent_class = NULL;
@@ -144,6 +154,7 @@ enum
   PROP_DISABLE_PASSTHROUGH = GST_VA_FILTER_PROP_LAST + 1,
   PROP_ADD_BORDERS,
   PROP_BACKGROUND_COLOR,
+  PROP_SKIP_UNCHANGED,
   N_PROPERTIES
 };
 
@@ -184,9 +195,18 @@ static void gst_va_vpp_colorbalance_init (gpointer iface, gpointer data);
 static void gst_va_vpp_rebuild_filters (GstVaVpp * self);
 
 static void
+gst_va_vpp_memo_reset (GstVaVpp * self)
+{
+  gst_clear_buffer (&self->memo_in);
+  gst_clear_buffer (&self->memo_out);
+}
+
+static void
 gst_va_vpp_dispose (GObject * object)
 {
   GstVaVpp *self = GST_VA_VPP (object);
+
+  gst_va_vpp_memo_reset (self);
 
   if (self->channels)
     g_list_free_full (g_steal_pointer (&self->channels), g_object_unref);
@@ -270,6 +290,7 @@ gst_va_vpp_set_property (GObject * object, guint prop_id,
   GstVaVpp *self = GST_VA_VPP (object);
 
   GST_OBJECT_LOCK (object);
+  self->generation++;
   switch (prop_id) {
     case GST_VA_FILTER_PROP_DENOISE:
       self->denoise = g_value_get_float (value);
@@ -345,6 +366,9 @@ gst_va_vpp_set_property (GObject * object, guint prop_id,
     case PROP_BACKGROUND_COLOR:
       self->background_color = (guint32) g_value_get_uint (value);
       break;
+    case PROP_SKIP_UNCHANGED:
+      self->skip_unchanged = g_value_get_boolean (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -417,6 +441,9 @@ gst_va_vpp_get_property (GObject * object, guint prop_id, GValue * value,
       break;
     case PROP_BACKGROUND_COLOR:
       g_value_set_uint (value, self->background_color);
+      break;
+    case PROP_SKIP_UNCHANGED:
+      g_value_set_boolean (value, self->skip_unchanged);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -498,6 +525,11 @@ gst_va_vpp_set_info (GstVaBaseTransform * btrans, GstCaps * incaps,
   GstVaVpp *self = GST_VA_VPP (btrans);
   GstCapsFeatures *infeat, *outfeat;
   gint from_dar_n, from_dar_d, to_dar_n, to_dar_d;
+
+  GST_OBJECT_LOCK (self);
+  self->generation++;
+  gst_va_vpp_memo_reset (self);
+  GST_OBJECT_UNLOCK (self);
 
   if (GST_VIDEO_INFO_INTERLACE_MODE (in_info) !=
       GST_VIDEO_INFO_INTERLACE_MODE (out_info)) {
@@ -808,6 +840,10 @@ gst_va_vpp_rebuild_filters (GstVaVpp * self)
   gst_va_filter_drop_filter_buffers (btrans->filter);
   _build_filters (self);
   g_atomic_int_set (&self->rebuild_filters, FALSE);
+
+  GST_OBJECT_LOCK (self);
+  self->generation++;
+  GST_OBJECT_UNLOCK (self);
 }
 
 static void
@@ -863,6 +899,79 @@ gst_va_vpp_prepare_output_buffer (GstBaseTransform * trans, GstBuffer * inbuf,
       inbuf, outbuf);
 }
 
+static gboolean
+_crop_equal (GstBuffer * a, GstBuffer * b)
+{
+  GstVideoCropMeta *ca = gst_buffer_get_video_crop_meta (a);
+  GstVideoCropMeta *cb = gst_buffer_get_video_crop_meta (b);
+
+  if (!ca || !cb)
+    return ca == cb;
+
+  return ca->x == cb->x && ca->y == cb->y && ca->width == cb->width
+      && ca->height == cb->height;
+}
+
+/* An input sharing its memory with the last processed one carries the
+ * same picture (the held reference keeps the memory from being
+ * recycled), and with nothing else changed the output would be the same
+ * too: give the output buffer the last output's memory and skip the VPP
+ * pass. Repeats come from videorate and from compositors that repeat an
+ * unchanged output, and a scaler behind them then hands the encoder a
+ * repeat by reference as well. */
+static gboolean
+gst_va_vpp_reuse_output (GstVaVpp * self, GstBuffer * inbuf,
+    GstBuffer * outbuf)
+{
+  guint i, n;
+
+  GST_OBJECT_LOCK (self);
+  if (!self->skip_unchanged || !self->memo_in || !self->memo_out
+      || self->memo_generation != self->generation || self->hdr_mapping) {
+    GST_OBJECT_UNLOCK (self);
+    return FALSE;
+  }
+
+  n = gst_buffer_n_memory (inbuf);
+  if (n == 0 || n != gst_buffer_n_memory (self->memo_in)) {
+    GST_OBJECT_UNLOCK (self);
+    return FALSE;
+  }
+  for (i = 0; i < n; i++) {
+    if (gst_buffer_peek_memory (inbuf, i) !=
+        gst_buffer_peek_memory (self->memo_in, i)) {
+      GST_OBJECT_UNLOCK (self);
+      return FALSE;
+    }
+  }
+
+  if (!_crop_equal (inbuf, self->memo_in)) {
+    GST_OBJECT_UNLOCK (self);
+    return FALSE;
+  }
+
+  /* Removing the memory tags the buffer, so its pool frees it instead of
+   * recycling it, and the shared memory stays with the memo. */
+  gst_buffer_remove_all_memory (outbuf);
+  gst_buffer_copy_into (outbuf, self->memo_out, GST_BUFFER_COPY_MEMORY, 0, -1);
+  GST_OBJECT_UNLOCK (self);
+
+  return TRUE;
+}
+
+static void
+gst_va_vpp_memo_store (GstVaVpp * self, GstBuffer * inbuf, GstBuffer * outbuf,
+    guint generation)
+{
+  GST_OBJECT_LOCK (self);
+  if (self->skip_unchanged) {
+    gst_buffer_replace (&self->memo_in, inbuf);
+    gst_buffer_replace (&self->memo_out, outbuf);
+    self->memo_generation = generation;
+  }
+  GST_OBJECT_UNLOCK (self);
+}
+
 static GstFlowReturn
 gst_va_vpp_transform (GstBaseTransform * trans, GstBuffer * inbuf,
     GstBuffer * outbuf)
@@ -872,9 +981,19 @@ gst_va_vpp_transform (GstBaseTransform * trans, GstBuffer * inbuf,
   GstBuffer *buf = NULL;
   GstFlowReturn res = GST_FLOW_OK;
   GstVaSample src, dst;
+  guint generation;
 
   if (G_UNLIKELY (!btrans->negotiated))
     goto unknown_format;
+
+  if (!self->pseudo_passthrough && gst_va_vpp_reuse_output (self, inbuf, outbuf)) {
+    GST_LOG_OBJECT (self, "input repeats the last one, repeating its output");
+    return GST_FLOW_OK;
+  }
+
+  GST_OBJECT_LOCK (self);
+  generation = self->generation;
+  GST_OBJECT_UNLOCK (self);
 
   res = gst_va_base_transform_import_buffer (btrans, inbuf, &buf);
   if (res != GST_FLOW_OK)
@@ -900,6 +1019,8 @@ gst_va_vpp_transform (GstBaseTransform * trans, GstBuffer * inbuf,
   if (!gst_va_filter_process (btrans->filter, &src, &dst)) {
     gst_buffer_set_flags (outbuf, GST_BUFFER_FLAG_CORRUPTED);
     res = GST_BASE_TRANSFORM_FLOW_DROPPED;
+  } else {
+    gst_va_vpp_memo_store (self, inbuf, outbuf, generation);
   }
 
 bail:
@@ -2200,6 +2321,23 @@ _install_static_properties (GObjectClass * klass)
       G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
   g_object_class_install_property (klass, PROP_BACKGROUND_COLOR,
       PROPERTIES (PROP_BACKGROUND_COLOR));
+
+  /**
+   * GstVaPostProc:skip-unchanged:
+   *
+   * When an input shares its memory with the previous input and no
+   * setting changed, repeat the previous output by reference instead of
+   * processing it again. The output then shares memory with the previous
+   * one, which downstream can detect (vah264enc skip-repeats).
+   *
+   * Since: 1.30
+   */
+  PROPERTIES (PROP_SKIP_UNCHANGED) =
+      g_param_spec_boolean ("skip-unchanged", "Skip unchanged",
+      "Repeat the last output by reference when the input repeats", FALSE,
+      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_PLAYING);
+  g_object_class_install_property (klass, PROP_SKIP_UNCHANGED,
+      PROPERTIES (PROP_SKIP_UNCHANGED));
 
 }
 

@@ -37,6 +37,9 @@ struct _GstVaBaseEncPrivate
 {
   GstVideoInfo sinkpad_info;
   GstBufferPool *raw_pool;
+  /* Held so its memory cannot be recycled while a later input is
+   * compared against it. */
+  GstBuffer *last_input;
 };
 
 enum
@@ -77,11 +80,15 @@ gst_va_base_enc_reset_state_default (GstVaBaseEnc * base)
   base->preferred_output_delay = 0;
   base->min_buffers = 1;
   g_atomic_int_set (&base->reconf, FALSE);
+  g_atomic_int_set (&base->rc_reconf, FALSE);
+  gst_clear_buffer (&base->priv->last_input);
 }
 
 static void
 _flush_all_frames (GstVaBaseEnc * base)
 {
+  gst_clear_buffer (&base->priv->last_input);
+
   g_queue_clear_full (&base->reorder_list,
       (GDestroyNotify) gst_video_codec_frame_unref);
   g_queue_clear_full (&base->output_list,
@@ -751,6 +758,32 @@ gst_va_base_enc_reset (GstVaBaseEnc * base)
   return TRUE;
 }
 
+/* A repeated frame reaches the encoder as a new buffer sharing the
+ * previous one's memory: videorate duplicates that way, and so does a
+ * compositor that reuses an unchanged output. Holding the last input
+ * keeps its memory from being recycled into a different picture, so
+ * equal memory means equal content. */
+static gboolean
+_input_repeats_last (GstVaBaseEnc * base, GstBuffer * input)
+{
+  GstBuffer *last = base->priv->last_input;
+  gboolean repeat = FALSE;
+  guint i, n;
+
+  n = gst_buffer_n_memory (input);
+  if (last && n > 0 && n == gst_buffer_n_memory (last)) {
+    repeat = TRUE;
+    for (i = 0; i < n && repeat; i++) {
+      repeat = gst_buffer_peek_memory (input, i) ==
+          gst_buffer_peek_memory (last, i);
+    }
+  }
+
+  gst_buffer_replace (&base->priv->last_input, input);
+
+  return repeat;
+}
+
 static GstFlowReturn
 gst_va_base_enc_handle_frame (GstVideoEncoder * venc,
     GstVideoCodecFrame * frame)
@@ -760,6 +793,7 @@ gst_va_base_enc_handle_frame (GstVideoEncoder * venc,
   GstFlowReturn ret;
   GstBuffer *in_buf = NULL;
   GstVideoCodecFrame *frame_encode = NULL;
+  gboolean repeat;
 
   GST_LOG_OBJECT (venc,
       "handle frame id %u, dts %" GST_TIME_FORMAT ", pts %" GST_TIME_FORMAT,
@@ -768,11 +802,23 @@ gst_va_base_enc_handle_frame (GstVideoEncoder * venc,
       GST_TIME_ARGS (GST_BUFFER_PTS (frame->input_buffer)));
 
   if (g_atomic_int_compare_and_exchange (&base->reconf, TRUE, FALSE)) {
+    g_atomic_int_set (&base->rc_reconf, FALSE);
     if (!gst_va_base_enc_reset (base)) {
       gst_video_encoder_finish_frame (venc, frame);
       return GST_FLOW_ERROR;
     }
+  } else if (g_atomic_int_compare_and_exchange (&base->rc_reconf, TRUE, FALSE)) {
+    if (!base_class->reconfig_rate_control
+        || !base_class->reconfig_rate_control (base)) {
+      GST_DEBUG_OBJECT (base, "Rate control change needs a full reconfig");
+      if (!gst_va_base_enc_reset (base)) {
+        gst_video_encoder_finish_frame (venc, frame);
+        return GST_FLOW_ERROR;
+      }
+    }
   }
+
+  repeat = _input_repeats_last (base, frame->input_buffer);
 
   ret = gst_va_base_enc_import_input_buffer (base,
       frame->input_buffer, &in_buf);
@@ -784,6 +830,8 @@ gst_va_base_enc_handle_frame (GstVideoEncoder * venc,
 
   if (!base_class->new_frame (base, frame))
     goto error_new_frame;
+
+  ((GstVaEncFrame *) gst_va_get_enc_frame (frame))->repeat = repeat;
 
   if (!base_class->reorder_frame (base, frame, FALSE, &frame_encode))
     goto error_reorder;
@@ -1199,9 +1247,96 @@ gst_va_base_enc_add_quality_level_parameter (GstVaBaseEnc * base,
   return TRUE;
 }
 
+static guint
+_count_bits (guint64 v)
+{
+  guint n = 0;
+
+  for (; v; v &= v - 1)
+    n++;
+
+  return n;
+}
+
+/* The hardware rate control never sees a skip picture, so with half the
+ * input repeated it would still budget each coded frame for the full
+ * input rate and code the stream at half its bitrate, starving exactly
+ * the frames that carry the picture. Budget for the rate actually coded:
+ * the input rate divided by a small integer measured over the last
+ * second or so. A divisor that is too high lets the coded frames
+ * overshoot, so going back towards the full rate reacts within a few
+ * frames, while going the other way waits for a full window. Every change
+ * resets the driver's BRC (bResetBRC), hence the coarse steps and a fresh
+ * window after each one. */
+#define SKIP_WINDOW 60
+#define SKIP_ATTACK_WINDOW 8
+#define MAX_FPS_DIVISOR 4
+
+void
+gst_va_coded_rate_reset (GstVaCodedRate * rate)
+{
+  rate->history = 0;
+  rate->history_len = 0;
+  rate->divisor = 1;
+}
+
+/**
+ * gst_va_coded_rate_push:
+ * @rate: the tracker
+ * @skipped: whether the frame was coded as a skip picture
+ *
+ * Records one frame and recomputes the divisor of the input rate the
+ * rate control should budget for.
+ *
+ * Returns: %TRUE when the divisor changed and the new frame rate has to
+ * reach the driver.
+ */
+gboolean
+gst_va_coded_rate_push (GstVaCodedRate * rate, gboolean skipped)
+{
+  guint64 window_mask = (G_GUINT64_CONSTANT (1) << SKIP_WINDOW) - 1;
+  guint64 attack_mask = (G_GUINT64_CONSTANT (1) << SKIP_ATTACK_WINDOW) - 1;
+  guint coded, divisor = rate->divisor;
+
+  rate->history = (rate->history << 1) | (skipped ? 1 : 0);
+  if (rate->history_len < 64)
+    rate->history_len++;
+
+  if (divisor > 1 && rate->history_len >= SKIP_ATTACK_WINDOW
+      && _count_bits (rate->history & attack_mask) * divisor <
+      (divisor - 1) * SKIP_ATTACK_WINDOW / 2) {
+    /* Far fewer repeats lately than the divisor assumes. */
+    divisor = 1;
+  } else if (rate->history_len >= SKIP_WINDOW) {
+    coded = SKIP_WINDOW - _count_bits (rate->history & window_mask);
+    divisor = coded ? (SKIP_WINDOW + coded / 2) / coded : MAX_FPS_DIVISOR;
+    divisor = CLAMP (divisor, 1, MAX_FPS_DIVISOR);
+  }
+
+  if (divisor == rate->divisor)
+    return FALSE;
+
+  rate->divisor = divisor;
+  /* Judge the new budget on frames coded under it only, or the window
+   * that just triggered the change would undo it. */
+  rate->history_len = 0;
+  return TRUE;
+}
+
 gboolean
 gst_va_base_enc_add_frame_rate_parameter (GstVaBaseEnc * base,
     GstVaEncodePicture * picture)
+{
+  return gst_va_base_enc_add_frame_rate_parameter_divided (base, picture, 1);
+}
+
+/* The frame rate the rate control budgets for, the input rate divided by
+ * @divisor: an encoder that codes only every n-th input frame on the
+ * hardware tells the driver so, or it would spend the per-frame budget of
+ * the full rate on each coded frame. */
+gboolean
+gst_va_base_enc_add_frame_rate_parameter_divided (GstVaBaseEnc * base,
+    GstVaEncodePicture * picture, guint divisor)
 {
   /* *INDENT-OFF* */
   struct
@@ -1214,7 +1349,8 @@ gst_va_base_enc_add_frame_rate_parameter (GstVaBaseEnc * base,
      * numerator   = framerate & 0xffff; */
     .fr.framerate =
         (GST_VIDEO_INFO_FPS_N (&base->in_info) & 0xffff) |
-        ((GST_VIDEO_INFO_FPS_D (&base->in_info) & 0xffff) << 16)
+        (((GST_VIDEO_INFO_FPS_D (&base->in_info) * MAX (divisor, 1)) & 0xffff)
+            << 16)
   };
   /* *INDENT-ON* */
 
