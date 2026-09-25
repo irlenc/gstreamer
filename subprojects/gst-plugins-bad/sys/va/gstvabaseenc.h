@@ -145,6 +145,9 @@ gboolean              gst_va_base_enc_add_quality_level_parameter (GstVaBaseEnc 
                                                                    guint target_usage);
 gboolean              gst_va_base_enc_add_frame_rate_parameter (GstVaBaseEnc * base,
                                                                 GstVaEncodePicture * picture);
+gboolean              gst_va_base_enc_add_frame_rate_parameter_divided (GstVaBaseEnc * base,
+                                                                        GstVaEncodePicture * picture,
+                                                                        guint divisor);
 gboolean              gst_va_base_enc_add_hrd_parameter   (GstVaBaseEnc * base,
                                                            GstVaEncodePicture * picture,
                                                            guint32 rc_mode,

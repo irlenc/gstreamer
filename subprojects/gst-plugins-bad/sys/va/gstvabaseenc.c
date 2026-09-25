@@ -1251,6 +1251,17 @@ gboolean
 gst_va_base_enc_add_frame_rate_parameter (GstVaBaseEnc * base,
     GstVaEncodePicture * picture)
 {
+  return gst_va_base_enc_add_frame_rate_parameter_divided (base, picture, 1);
+}
+
+/* The frame rate the rate control budgets for, the input rate divided by
+ * @divisor: an encoder that codes only every n-th input frame on the
+ * hardware tells the driver so, or it would spend the per-frame budget of
+ * the full rate on each coded frame. */
+gboolean
+gst_va_base_enc_add_frame_rate_parameter_divided (GstVaBaseEnc * base,
+    GstVaEncodePicture * picture, guint divisor)
+{
   /* *INDENT-OFF* */
   struct
   {
@@ -1262,7 +1273,8 @@ gst_va_base_enc_add_frame_rate_parameter (GstVaBaseEnc * base,
      * numerator   = framerate & 0xffff; */
     .fr.framerate =
         (GST_VIDEO_INFO_FPS_N (&base->in_info) & 0xffff) |
-        ((GST_VIDEO_INFO_FPS_D (&base->in_info) & 0xffff) << 16)
+        (((GST_VIDEO_INFO_FPS_D (&base->in_info) * MAX (divisor, 1)) & 0xffff)
+            << 16)
   };
   /* *INDENT-ON* */
 
