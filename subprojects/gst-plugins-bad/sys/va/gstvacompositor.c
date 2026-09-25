@@ -265,6 +265,7 @@ struct _GstVaCompositor
   guint32 background_color;
 
   gboolean skip_unchanged;
+  gboolean single_pad_passthrough;
   /* What produced the last composition: one GstVaCompositorMemoEntry
    * per contributing pad in paint order, holding its input buffer so the
    * memory cannot be recycled into a different picture. */
@@ -298,6 +299,7 @@ enum
   PROP_INTERPOLATION_METHOD,
   PROP_BACKGROUND_COLOR,
   PROP_SKIP_UNCHANGED,
+  PROP_SINGLE_PAD_PASSTHROUGH,
   N_PROPERTIES
 };
 
@@ -336,6 +338,13 @@ gst_va_compositor_set_property (GObject * object, guint prop_id,
     {
       GST_OBJECT_LOCK (object);
       self->skip_unchanged = g_value_get_boolean (value);
+      GST_OBJECT_UNLOCK (object);
+      break;
+    }
+    case PROP_SINGLE_PAD_PASSTHROUGH:
+    {
+      GST_OBJECT_LOCK (object);
+      self->single_pad_passthrough = g_value_get_boolean (value);
       GST_OBJECT_UNLOCK (object);
       break;
     }
@@ -388,6 +397,13 @@ gst_va_compositor_get_property (GObject * object, guint prop_id,
     {
       GST_OBJECT_LOCK (object);
       g_value_set_boolean (value, self->skip_unchanged);
+      GST_OBJECT_UNLOCK (object);
+      break;
+    }
+    case PROP_SINGLE_PAD_PASSTHROUGH:
+    {
+      GST_OBJECT_LOCK (object);
+      g_value_set_boolean (value, self->single_pad_passthrough);
       GST_OBJECT_UNLOCK (object);
       break;
     }
@@ -1345,6 +1361,113 @@ gst_va_compositor_reuse_output (GstVaCompositor * self, GstBuffer * outbuf,
   return TRUE;
 }
 
+static gboolean
+gst_va_compositor_video_meta_equal (GstBuffer * a, GstBuffer * b)
+{
+  GstVideoMeta *ma = gst_buffer_get_video_meta (a);
+  GstVideoMeta *mb = gst_buffer_get_video_meta (b);
+  guint i;
+
+  if (!ma || !mb)
+    return ma == mb;
+
+  if (ma->format != mb->format || ma->width != mb->width
+      || ma->height != mb->height || ma->n_planes != mb->n_planes)
+    return FALSE;
+
+  for (i = 0; i < ma->n_planes; i++) {
+    if (ma->offset[i] != mb->offset[i] || ma->stride[i] != mb->stride[i])
+      return FALSE;
+  }
+
+  return TRUE;
+}
+
+/* When the obscured skip leaves exactly one pad, and that pad paints the
+ * whole canvas with its own pixels unscaled and opaque, the composition
+ * is a copy of its buffer. Hand the buffer's memory out instead of
+ * blitting it: this is the common single camera scene, and without it
+ * every compositor tier costs a full canvas pass per frame. Only memory
+ * the output could have come from qualifies (same display, allocator
+ * type and layout), so downstream cannot tell the difference. */
+static gboolean
+gst_va_compositor_pass_single_pad (GstVaCompositor * self, GstBuffer * outbuf)
+{
+  GstVideoAggregator *vagg = GST_VIDEO_AGGREGATOR (self);
+  GstVideoAggregatorPad *visible = NULL;
+  GstVaCompositorPad *pad;
+  GstBuffer *inbuf;
+  GstMemory *in_mem, *out_mem;
+  VARectangle region;
+  gboolean ok;
+  GList *l;
+
+  GST_OBJECT_LOCK (self);
+  if (!self->single_pad_passthrough || self->other_pool) {
+    GST_OBJECT_UNLOCK (self);
+    return FALSE;
+  }
+
+  for (l = GST_ELEMENT (self)->sinkpads; l; l = l->next) {
+    GstVideoAggregatorPad *vaggpad = GST_VIDEO_AGGREGATOR_PAD (l->data);
+
+    if (!gst_video_aggregator_pad_has_current_buffer (vaggpad))
+      continue;
+    if (gst_va_compositor_pad_obscured (vaggpad, l->next))
+      continue;
+    if (visible) {
+      GST_OBJECT_UNLOCK (self);
+      return FALSE;
+    }
+    visible = vaggpad;
+  }
+
+  if (!visible) {
+    GST_OBJECT_UNLOCK (self);
+    return FALSE;
+  }
+
+  pad = GST_VA_COMPOSITOR_PAD (visible);
+  inbuf = gst_buffer_ref (gst_video_aggregator_pad_get_current_buffer (visible));
+
+  GST_OBJECT_LOCK (visible);
+  gst_va_compositor_pad_output_region (visible, &region);
+  ok = pad->alpha >= 1.0 && !GST_VIDEO_INFO_HAS_ALPHA (&visible->info)
+      && region.x == 0 && region.y == 0
+      && region.width == GST_VIDEO_INFO_WIDTH (&vagg->info)
+      && region.height == GST_VIDEO_INFO_HEIGHT (&vagg->info)
+      && GST_VIDEO_INFO_WIDTH (&visible->info) == region.width
+      && GST_VIDEO_INFO_HEIGHT (&visible->info) == region.height
+      && GST_VIDEO_INFO_FORMAT (&visible->info) ==
+      GST_VIDEO_INFO_FORMAT (&vagg->info)
+      && gst_video_colorimetry_is_equal (&visible->info.colorimetry,
+      &vagg->info.colorimetry);
+  GST_OBJECT_UNLOCK (visible);
+  GST_OBJECT_UNLOCK (self);
+
+  ok = ok && !gst_buffer_get_video_crop_meta (inbuf)
+      && gst_buffer_n_memory (inbuf) == 1 && gst_buffer_n_memory (outbuf) == 1
+      && gst_va_buffer_peek_display (inbuf) == self->display;
+
+  if (ok) {
+    in_mem = gst_buffer_peek_memory (inbuf, 0);
+    out_mem = gst_buffer_peek_memory (outbuf, 0);
+    ok = G_TYPE_FROM_INSTANCE (in_mem->allocator) ==
+        G_TYPE_FROM_INSTANCE (out_mem->allocator)
+        && gst_va_compositor_video_meta_equal (inbuf, outbuf);
+  }
+
+  if (ok) {
+    /* Removing the memory tags the buffer, so its pool frees it instead
+     * of recycling it. */
+    gst_buffer_remove_all_memory (outbuf);
+    gst_buffer_copy_into (outbuf, inbuf, GST_BUFFER_COPY_MEMORY, 0, -1);
+  }
+
+  gst_buffer_unref (inbuf);
+  return ok;
+}
+
 static void
 gst_va_compositor_memo_store (GstVaCompositor * self, GArray * snapshot,
     GstBuffer * outbuf)
@@ -1390,6 +1513,13 @@ gst_va_compositor_aggregate_frames (GstVideoAggregator * vagg,
 
   if (gst_va_compositor_reuse_output (self, outbuf, &snapshot)) {
     GST_LOG_OBJECT (self, "inputs unchanged, repeating the last output");
+    return GST_FLOW_OK;
+  }
+
+  if (gst_va_compositor_pass_single_pad (self, outbuf)) {
+    GST_LOG_OBJECT (self, "one opaque full canvas pad, passing it through");
+    if (snapshot)
+      gst_va_compositor_memo_store (self, snapshot, outbuf);
     return GST_FLOW_OK;
   }
 
@@ -2114,6 +2244,23 @@ gst_va_compositor_class_init (gpointer g_class, gpointer class_data)
       G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_PLAYING);
   g_object_class_install_property (object_class, PROP_SKIP_UNCHANGED,
       properties[PROP_SKIP_UNCHANGED]);
+
+  /**
+   * GstVaCompositor:single-pad-passthrough:
+   *
+   * When exactly one pad remains visible after fully obscured pads are
+   * skipped, and it covers the whole output opaque, unscaled and in the
+   * output format, output that pad's buffer memory instead of blitting
+   * it. Only applies when the output stays in VA memory.
+   *
+   * Since: 1.30
+   */
+  properties[PROP_SINGLE_PAD_PASSTHROUGH] =
+      g_param_spec_boolean ("single-pad-passthrough", "Single pad passthrough",
+      "Output a lone opaque full canvas pad without composing it", FALSE,
+      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_PLAYING);
+  g_object_class_install_property (object_class, PROP_SINGLE_PAD_PASSTHROUGH,
+      properties[PROP_SINGLE_PAD_PASSTHROUGH]);
 
   g_free (long_name);
   g_free (cdata->description);
