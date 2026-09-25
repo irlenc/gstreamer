@@ -23,6 +23,7 @@ va_sources = [
   'gstvajpegdec.c',
   'gstvajpegenc.c',
   'gstvampeg2dec.c',
+  'gstvaratecontrol.c',
   'gstvaoverlaycompositor.c',
   'gstvapluginutils.c',
   'gstvaprofile.c',
