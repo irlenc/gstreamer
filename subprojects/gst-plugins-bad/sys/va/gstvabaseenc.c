@@ -77,6 +77,7 @@ gst_va_base_enc_reset_state_default (GstVaBaseEnc * base)
   base->preferred_output_delay = 0;
   base->min_buffers = 1;
   g_atomic_int_set (&base->reconf, FALSE);
+  g_atomic_int_set (&base->rc_reconf, FALSE);
 }
 
 static void
@@ -768,9 +769,19 @@ gst_va_base_enc_handle_frame (GstVideoEncoder * venc,
       GST_TIME_ARGS (GST_BUFFER_PTS (frame->input_buffer)));
 
   if (g_atomic_int_compare_and_exchange (&base->reconf, TRUE, FALSE)) {
+    g_atomic_int_set (&base->rc_reconf, FALSE);
     if (!gst_va_base_enc_reset (base)) {
       gst_video_encoder_finish_frame (venc, frame);
       return GST_FLOW_ERROR;
+    }
+  } else if (g_atomic_int_compare_and_exchange (&base->rc_reconf, TRUE, FALSE)) {
+    if (!base_class->reconfig_rate_control
+        || !base_class->reconfig_rate_control (base)) {
+      GST_DEBUG_OBJECT (base, "Rate control change needs a full reconfig");
+      if (!gst_va_base_enc_reset (base)) {
+        gst_video_encoder_finish_frame (venc, frame);
+        return GST_FLOW_ERROR;
+      }
     }
   }
 

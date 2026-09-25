@@ -280,6 +280,10 @@ struct _GstVaH264Enc
   } rc;
 
   GstH264SPS sequence_hdr;
+
+  /* The rate control was retuned without a reconfig and the next
+   * picture has to carry the new parameters. */
+  gboolean rc_update_pending;
 };
 
 struct _GstVaH264EncFrame
@@ -1439,6 +1443,67 @@ out:
   return ret;
 }
 
+/* Retunes the bitrate of a running encoder. The driver resets its
+ * BRC when the rate control parameters change on a non IDR picture
+ * (media-driver sets bResetBRC), so a live bitrate change does not
+ * have to reopen the encoder and start a new GOP. Anything that would
+ * change the stream headers beyond the HRD, a new level or a new rate
+ * control mode, still takes the full reconfig. */
+static gboolean
+gst_va_h264_enc_reconfig_rate_control (GstVaBaseEnc * base)
+{
+  GstVaH264Enc *self = GST_VA_H264_ENC (base);
+  guint8 level_idc = self->level_idc;
+  guint32 rc_ctrl_mode = self->rc.rc_ctrl_mode;
+
+  if (!base->encoder || !gst_va_encoder_is_open (base->encoder))
+    return FALSE;
+
+  switch (rc_ctrl_mode) {
+    case VA_RC_CBR:
+    case VA_RC_VBR:
+    case VA_RC_VCM:
+    case VA_RC_QVBR:
+      break;
+    default:
+      return FALSE;
+  }
+
+  GST_OBJECT_LOCK (self);
+  self->rc.rc_ctrl_mode = self->prop.rc_ctrl;
+  self->rc.min_qp = self->prop.min_qp;
+  self->rc.max_qp = self->prop.max_qp;
+  self->rc.qp_i = self->prop.qp_i;
+  self->rc.qp_p = self->prop.qp_p;
+  self->rc.qp_b = self->prop.qp_b;
+  self->rc.mbbrc = self->prop.mbbrc;
+  self->rc.target_percentage = self->prop.target_percentage;
+  self->rc.target_usage = self->prop.target_usage;
+  self->rc.cpb_size = self->prop.cpb_size;
+  GST_OBJECT_UNLOCK (self);
+
+  self->rc.max_bitrate = 0;
+  self->rc.target_bitrate = 0;
+  self->rc.max_bitrate_bits = 0;
+  self->rc.target_bitrate_bits = 0;
+  self->rc.cpb_length_bits = 0;
+
+  if (!_ensure_rate_control (self))
+    return FALSE;
+
+  if (self->rc.rc_ctrl_mode != rc_ctrl_mode)
+    return FALSE;
+
+  if (!_calculate_level (self) || self->level_idc != level_idc)
+    return FALSE;
+
+  GST_INFO_OBJECT (self, "Rate control retuned in place: max bitrate %u, "
+      "target bitrate %u kbps", self->rc.max_bitrate, self->rc.target_bitrate);
+
+  self->rc_update_pending = TRUE;
+  return TRUE;
+}
+
 /* Clear all the info of last reconfig and set the fields based on
  * property. The reconfig may change these fields because of the
  * profile/level and HW limitation. */
@@ -1507,6 +1572,7 @@ gst_va_h264_enc_reset_state (GstVaBaseEnc * base)
   self->rc.max_bitrate_bits = 0;
   self->rc.target_bitrate_bits = 0;
   self->rc.cpb_length_bits = 0;
+  self->rc_update_pending = FALSE;
 
   memset (&self->sequence_hdr, 0, sizeof (GstH264SPS));
 }
@@ -2923,6 +2989,21 @@ _encode_one_frame (GstVaH264Enc * self, GstVideoCodecFrame * gst_frame)
   if (self->aud && !_add_aud (self, frame))
     return FALSE;
 
+  /* An IDR sends the whole sequence state below, so only a non IDR
+   * picture needs the retuned rate control on its own. */
+  if (self->rc_update_pending && frame->poc != 0) {
+    if (!gst_va_base_enc_add_rate_control_parameter (base, frame->base.picture,
+            self->rc.rc_ctrl_mode, self->rc.max_bitrate_bits,
+            self->rc.target_percentage, self->rc.qp_i, self->rc.min_qp,
+            self->rc.max_qp, self->rc.mbbrc))
+      return FALSE;
+
+    if (!gst_va_base_enc_add_hrd_parameter (base, frame->base.picture,
+            self->rc.rc_ctrl_mode, self->rc.cpb_length_bits))
+      return FALSE;
+  }
+  self->rc_update_pending = FALSE;
+
   /* Repeat the SPS for IDR. */
   if (frame->poc == 0) {
     VAEncSequenceParameterBufferH264 sequence;
@@ -3409,12 +3490,12 @@ gst_va_h264_enc_set_property (GObject * object, guint prop_id,
     case PROP_BITRATE:
       self->prop.bitrate = g_value_get_uint (value);
       no_effect = FALSE;
-      g_atomic_int_set (&GST_VA_BASE_ENC (self)->reconf, TRUE);
+      g_atomic_int_set (&GST_VA_BASE_ENC (self)->rc_reconf, TRUE);
       break;
     case PROP_TARGET_PERCENTAGE:
       self->prop.target_percentage = g_value_get_uint (value);
       no_effect = FALSE;
-      g_atomic_int_set (&GST_VA_BASE_ENC (self)->reconf, TRUE);
+      g_atomic_int_set (&GST_VA_BASE_ENC (self)->rc_reconf, TRUE);
       break;
     case PROP_TARGET_USAGE:
       self->prop.target_usage = g_value_get_uint (value);
@@ -3614,6 +3695,8 @@ gst_va_h264_enc_class_init (gpointer g_klass, gpointer class_data)
 
   va_enc_class->reset_state = GST_DEBUG_FUNCPTR (gst_va_h264_enc_reset_state);
   va_enc_class->reconfig = GST_DEBUG_FUNCPTR (gst_va_h264_enc_reconfig);
+  va_enc_class->reconfig_rate_control =
+      GST_DEBUG_FUNCPTR (gst_va_h264_enc_reconfig_rate_control);
   va_enc_class->new_frame = GST_DEBUG_FUNCPTR (gst_va_h264_enc_new_frame);
   va_enc_class->reorder_frame =
       GST_DEBUG_FUNCPTR (gst_va_h264_enc_reorder_frame);

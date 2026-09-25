@@ -53,6 +53,10 @@ struct _GstVaBaseEnc
   GstVaEncoder *encoder;
 
   gboolean reconf;
+  /* Set when only the rate control targets changed: the subclass may
+   * retune the running encoder instead of reopening it, which would
+   * start a new IDR. */
+  gboolean rc_reconf;
 
   gboolean is_live;
 
@@ -91,6 +95,8 @@ struct _GstVaBaseEncClass
 
   void     (*reset_state)    (GstVaBaseEnc * encoder);
   gboolean (*reconfig)       (GstVaBaseEnc * encoder);
+  /* Optional. Returns FALSE when the change needs a full reconfig. */
+  gboolean (*reconfig_rate_control) (GstVaBaseEnc * encoder);
   gboolean (*new_frame)      (GstVaBaseEnc * encoder,
                               GstVideoCodecFrame * frame);
   gboolean (*reorder_frame)  (GstVaBaseEnc * base,
