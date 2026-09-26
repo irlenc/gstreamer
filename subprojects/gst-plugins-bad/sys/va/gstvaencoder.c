@@ -50,6 +50,14 @@ struct _GstVaEncoder
   gint coded_height;
   gint codedbuf_size;
 
+  /* Coded buffers of finished pictures, kept for the next ones. A coded
+   * buffer is megabytes of GPU memory, and making one per picture costs
+   * the kernel an allocation, a zeroing, a GPU mapping and a CPU mapping
+   * every frame. The generation changes whenever the context or the size
+   * does, so a buffer made for the old ones is destroyed, not reused. */
+  GArray *free_coded_buffers;
+  guint coded_generation;
+
   struct
   {
     GstBufferPool *pool;
@@ -273,6 +281,23 @@ _destroy_context (GstVaEncoder * self)
     GST_ERROR_OBJECT (self, "vaDestroyContext: %s", vaErrorStr (status));
 }
 
+/* Called with the object lock held. */
+static void
+_drop_free_coded_buffers_unlocked (GstVaEncoder * self)
+{
+  guint i;
+
+  self->coded_generation++;
+  if (!self->free_coded_buffers)
+    return;
+
+  for (i = 0; i < self->free_coded_buffers->len; i++) {
+    _destroy_buffer (self->display, g_array_index (self->free_coded_buffers,
+            VABufferID, i));
+  }
+  g_array_set_size (self->free_coded_buffers, 0);
+}
+
 gboolean
 gst_va_encoder_close (GstVaEncoder * self)
 {
@@ -281,6 +306,10 @@ gst_va_encoder_close (GstVaEncoder * self)
   VAConfigID config;
 
   g_return_val_if_fail (GST_IS_VA_ENCODER (self), FALSE);
+
+  GST_OBJECT_LOCK (self);
+  _drop_free_coded_buffers_unlocked (self);
+  GST_OBJECT_UNLOCK (self);
 
   _destroy_context (self);
 
@@ -699,6 +728,7 @@ gst_va_encoder_dispose (GObject * object)
 
   gst_va_encoder_close (self);
 
+  g_clear_pointer (&self->free_coded_buffers, g_array_unref);
   g_clear_pointer (&self->available_profiles, g_array_unref);
   gst_clear_object (&self->display);
 
@@ -798,6 +828,8 @@ gst_va_encoder_set_coded_buffer_size (GstVaEncoder * self,
   g_return_if_fail (coded_buffer_size > 0);
 
   GST_OBJECT_LOCK (self);
+  if (self->codedbuf_size != coded_buffer_size)
+    _drop_free_coded_buffers_unlocked (self);
   self->codedbuf_size = coded_buffer_size;
   GST_OBJECT_UNLOCK (self);
 }
@@ -1173,10 +1205,11 @@ GstVaEncodePicture *
 gst_va_encode_picture_new (GstVaEncoder * self, GstBuffer * raw_buffer)
 {
   GstVaEncodePicture *pic;
-  VABufferID coded_buffer;
+  VABufferID coded_buffer = VA_INVALID_ID;
   VADisplay dpy;
   VAStatus status;
   gint codedbuf_size;
+  guint coded_generation;
   GstBufferPool *recon_pool = NULL;
   GstBuffer *reconstruct_buffer = NULL;
   GstFlowReturn ret;
@@ -1196,6 +1229,13 @@ gst_va_encode_picture_new (GstVaEncoder * self, GstBuffer * raw_buffer)
   }
 
   codedbuf_size = self->codedbuf_size;
+  coded_generation = self->coded_generation;
+  if (self->free_coded_buffers && self->free_coded_buffers->len > 0) {
+    guint last = self->free_coded_buffers->len - 1;
+
+    coded_buffer = g_array_index (self->free_coded_buffers, VABufferID, last);
+    g_array_remove_index (self->free_coded_buffers, last);
+  }
 
   GST_OBJECT_UNLOCK (self);
 
@@ -1210,19 +1250,23 @@ gst_va_encode_picture_new (GstVaEncoder * self, GstBuffer * raw_buffer)
   if (ret != GST_FLOW_OK) {
     GST_ERROR_OBJECT (self, "Failed to create the reconstruct picture");
     gst_clear_buffer (&reconstruct_buffer);
+    if (coded_buffer != VA_INVALID_ID)
+      _destroy_buffer (self->display, coded_buffer);
     return NULL;
   }
 
-  /* this has to be assigned before */
-  g_assert (codedbuf_size > 0);
+  if (coded_buffer == VA_INVALID_ID) {
+    /* this has to be assigned before */
+    g_assert (codedbuf_size > 0);
 
-  dpy = gst_va_display_get_va_dpy (self->display);
-  status = vaCreateBuffer (dpy, self->context, VAEncCodedBufferType,
-      codedbuf_size, 1, NULL, &coded_buffer);
-  if (status != VA_STATUS_SUCCESS) {
-    GST_ERROR_OBJECT (self, "vaCreateBuffer: %s", vaErrorStr (status));
-    gst_clear_buffer (&reconstruct_buffer);
-    return NULL;
+    dpy = gst_va_display_get_va_dpy (self->display);
+    status = vaCreateBuffer (dpy, self->context, VAEncCodedBufferType,
+        codedbuf_size, 1, NULL, &coded_buffer);
+    if (status != VA_STATUS_SUCCESS) {
+      GST_ERROR_OBJECT (self, "vaCreateBuffer: %s", vaErrorStr (status));
+      gst_clear_buffer (&reconstruct_buffer);
+      return NULL;
+    }
   }
 
   pic = g_new (GstVaEncodePicture, 1);
@@ -1230,6 +1274,8 @@ gst_va_encode_picture_new (GstVaEncoder * self, GstBuffer * raw_buffer)
   pic->reconstruct_buffer = reconstruct_buffer;
   pic->coded_buffer = coded_buffer;
   pic->corrupt = FALSE;
+  pic->encoder = gst_object_ref (self);
+  pic->coded_generation = coded_generation;
 
   pic->params = g_array_sized_new (FALSE, FALSE, sizeof (VABufferID), 8);
 
@@ -1244,6 +1290,26 @@ gst_va_encode_picture_free (GstVaEncodePicture * pic)
   g_return_if_fail (pic);
 
   _destroy_all_buffers (pic);
+
+  if (pic->encoder && pic->coded_buffer != VA_INVALID_ID) {
+    GstVaEncoder *self = pic->encoder;
+
+    /* Enough for the pictures of a reorder window in flight; a burst
+     * beyond it frees what it made. */
+    GST_OBJECT_LOCK (self);
+    if (pic->coded_generation == self->coded_generation) {
+      if (!self->free_coded_buffers) {
+        self->free_coded_buffers =
+            g_array_sized_new (FALSE, FALSE, sizeof (VABufferID), 16);
+      }
+      if (self->free_coded_buffers->len < 16) {
+        g_array_append_val (self->free_coded_buffers, pic->coded_buffer);
+        pic->coded_buffer = VA_INVALID_ID;
+      }
+    }
+    GST_OBJECT_UNLOCK (self);
+  }
+  gst_clear_object (&pic->encoder);
 
   display = gst_va_buffer_peek_display (pic->raw_buffer);
   if (!display)

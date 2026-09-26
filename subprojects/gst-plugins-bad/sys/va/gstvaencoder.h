@@ -41,6 +41,11 @@ struct _GstVaEncodePicture
 
   VABufferID coded_buffer;
   gboolean corrupt;
+
+  /* Where the coded buffer goes back to for reuse, and which of the
+   * encoder's contexts it was made for. */
+  GstVaEncoder *encoder;
+  guint coded_generation;
 };
 
 gboolean              gst_va_encoder_is_open              (GstVaEncoder * self);
