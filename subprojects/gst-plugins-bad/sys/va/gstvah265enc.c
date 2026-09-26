@@ -117,6 +117,10 @@ enum
   PROP_NUM_TILE_ROWS,
   PROP_SKIP_REPEATS,
   PROP_APP_RATE_CONTROL,
+  PROP_INTRA_REFRESH_TYPE,
+  PROP_INTRA_REFRESH_CYCLE_SIZE,
+  PROP_INTRA_REFRESH_QP_DELTA,
+  PROP_INTRA_REFRESH_CYCLE_DIST,
   /* Must stay last: class_init drops it when rate control is not
    * supported. */
   PROP_RATE_CONTROL,
@@ -192,6 +196,11 @@ struct _GstVaH265Enc
     guint32 target_usage;
     gboolean skip_repeats;
     gboolean app_rc;
+    /* VA_ENC_INTRA_REFRESH_* */
+    guint32 ir_type;
+    guint32 ir_cycle_size;
+    gint32 ir_qp_delta;
+    guint32 ir_cycle_dist;
   } prop;
 
   /* H265 fields */
@@ -389,6 +398,8 @@ struct _GstVaH265Enc
    * keeps the mode the stream is built for. */
   gboolean app_rc;
   GstVaRateControl app_rate_control;
+
+  GstVaIntraRefresh ir;
 };
 
 struct _GstVaH265EncFrame
@@ -2101,6 +2112,17 @@ _h265_encode_one_frame (GstVaH265Enc * self, GstVideoCodecFrame * gst_frame)
   if (!_h265_add_picture_parameter (self, frame, &pic_param))
     return FALSE;
 
+  /* A repeat coded as a skip picture never gets here, so it does not
+   * move the refresh: it is not a reference, and the next coded picture
+   * predicts from the same picture as the skip picture did. A low delay
+   * B picture keeps the P type here and refreshes as one. */
+  if (frame->type == GST_H265_I_SLICE) {
+    gst_va_intra_refresh_restart (&self->ir);
+  } else if (frame->type == GST_H265_P_SLICE
+      && !gst_va_intra_refresh_add (&self->ir, base, frame->base.picture)) {
+    return FALSE;
+  }
+
   _h265_fill_pps (self, &pic_param, &self->sps_hdr, &pps);
 
   if ((self->packed_headers & VA_ENC_PACKED_HEADER_PICTURE)
@@ -3793,6 +3815,41 @@ _h265_init_app_rate_control (GstVaH265Enc * self)
       self->app_rate_control.buffer_size, self->app_rate_control.initial_qp);
 }
 
+/* VA gives the refresh location and size in macroblocks, which H.265
+ * does not have. iHD takes them in 32x32 blocks: it bounds them by the
+ * frame size over 32 and hands them to VDEnc unscaled. Other drivers are
+ * taken to count CTUs. */
+static void
+_h265_ensure_intra_refresh (GstVaH265Enc * self)
+{
+  GstVaBaseEnc *base = GST_VA_BASE_ENC (self);
+  guint32 mode, cycle_size, cycle_dist;
+  gint32 qp_delta;
+  guint width_units, height_units;
+
+  GST_OBJECT_LOCK (self);
+  mode = self->prop.ir_type;
+  cycle_size = self->prop.ir_cycle_size;
+  cycle_dist = self->prop.ir_cycle_dist;
+  qp_delta = self->prop.ir_qp_delta;
+  GST_OBJECT_UNLOCK (self);
+
+  if (GST_VA_DISPLAY_IS_IMPLEMENTATION (base->display, INTEL_IHD)) {
+    width_units = (self->luma_width + 31) / 32;
+    height_units = (self->luma_height + 31) / 32;
+  } else {
+    width_units = self->ctu_width;
+    height_units = self->ctu_height;
+  }
+
+  if (!gst_va_intra_refresh_setup (&self->ir, base, mode, cycle_size,
+          cycle_dist, qp_delta, width_units, height_units)
+      && mode != VA_ENC_INTRA_REFRESH_NONE) {
+    update_property_uint (base, &self->prop.ir_type,
+        VA_ENC_INTRA_REFRESH_NONE, PROP_INTRA_REFRESH_TYPE);
+  }
+}
+
 /* Derives the level and tier from the currently set limits */
 static gboolean
 _h265_calculate_tier_level (GstVaH265Enc * self)
@@ -4992,6 +5049,8 @@ gst_va_h265_enc_reconfig (GstVaBaseEnc * base)
       base->width, base->height, self->ctu_width, self->ctu_height,
       GST_TIME_ARGS (base->frame_duration));
 
+  _h265_ensure_intra_refresh (self);
+
   if (!_h265_ensure_rate_control (self))
     return FALSE;
 
@@ -5001,7 +5060,21 @@ gst_va_h265_enc_reconfig (GstVaBaseEnc * base)
   if (!_h265_generate_gop_structure (self))
     return FALSE;
 
+  gst_va_intra_refresh_check_gop (&self->ir, base, self->gop.num_bframes,
+      self->gop.forward_ref_num);
+
   _h265_setup_encoding_features (self);
+
+  /* With temporal MV prediction, motion is predicted from the collocated
+   * picture's motion field, which is wrong in the decoder after a loss.
+   * The refresh only bounds where the clean region takes its pixels from,
+   * while the clean region along the boundary still takes merge and AMVP
+   * candidates from the dirty one (the bottom right collocated block, the
+   * above right neighbour), so the wrong motion leaks into it. Without
+   * TMVP every motion vector decodes as encoded and only pixels can be
+   * wrong, which the refresh cleans. */
+  if (self->ir.mode)
+    _h265_init_mvp (self, FALSE);
 
   _h265_calculate_coded_size (self);
 
@@ -5091,6 +5164,7 @@ gst_va_h265_enc_flush (GstVideoEncoder * venc)
   /* begin from an IDR after flush. */
   self->gop.cur_frame_index = 0;
   self->gop.last_keyframe = NULL;
+  gst_va_intra_refresh_restart (&self->ir);
 
   return GST_VIDEO_ENCODER_CLASS (parent_class)->flush (venc);
 }
@@ -5227,6 +5301,10 @@ gst_va_h265_enc_init (GTypeInstance * instance, gpointer g_class)
   self->prop.cpb_size = 0;
   self->prop.skip_repeats = FALSE;
   self->prop.app_rc = FALSE;
+  self->prop.ir_type = VA_ENC_INTRA_REFRESH_NONE;
+  self->prop.ir_cycle_size = 0;
+  self->prop.ir_qp_delta = 0;
+  self->prop.ir_cycle_dist = 0;
   if (properties[PROP_RATE_CONTROL]) {
     self->prop.rc_ctrl =
         G_PARAM_SPEC_ENUM (properties[PROP_RATE_CONTROL])->default_value;
@@ -5342,6 +5420,26 @@ gst_va_h265_enc_set_property (GObject * object, guint prop_id,
       break;
     case PROP_APP_RATE_CONTROL:
       self->prop.app_rc = g_value_get_boolean (value);
+      no_effect = FALSE;
+      g_atomic_int_set (&GST_VA_BASE_ENC (self)->reconf, TRUE);
+      break;
+    case PROP_INTRA_REFRESH_TYPE:
+      self->prop.ir_type = g_value_get_enum (value);
+      no_effect = FALSE;
+      g_atomic_int_set (&GST_VA_BASE_ENC (self)->reconf, TRUE);
+      break;
+    case PROP_INTRA_REFRESH_CYCLE_SIZE:
+      self->prop.ir_cycle_size = g_value_get_uint (value);
+      no_effect = FALSE;
+      g_atomic_int_set (&GST_VA_BASE_ENC (self)->reconf, TRUE);
+      break;
+    case PROP_INTRA_REFRESH_QP_DELTA:
+      self->prop.ir_qp_delta = g_value_get_int (value);
+      no_effect = FALSE;
+      g_atomic_int_set (&GST_VA_BASE_ENC (self)->reconf, TRUE);
+      break;
+    case PROP_INTRA_REFRESH_CYCLE_DIST:
+      self->prop.ir_cycle_dist = g_value_get_uint (value);
       no_effect = FALSE;
       g_atomic_int_set (&GST_VA_BASE_ENC (self)->reconf, TRUE);
       break;
@@ -5461,6 +5559,18 @@ gst_va_h265_enc_get_property (GObject * object, guint prop_id,
       break;
     case PROP_APP_RATE_CONTROL:
       g_value_set_boolean (value, self->prop.app_rc);
+      break;
+    case PROP_INTRA_REFRESH_TYPE:
+      g_value_set_enum (value, self->prop.ir_type);
+      break;
+    case PROP_INTRA_REFRESH_CYCLE_SIZE:
+      g_value_set_uint (value, self->prop.ir_cycle_size);
+      break;
+    case PROP_INTRA_REFRESH_QP_DELTA:
+      g_value_set_int (value, self->prop.ir_qp_delta);
+      break;
+    case PROP_INTRA_REFRESH_CYCLE_DIST:
+      g_value_set_uint (value, self->prop.ir_cycle_dist);
       break;
     case PROP_RATE_CONTROL:
       g_value_set_enum (value, self->prop.rc_ctrl);
@@ -5828,6 +5938,66 @@ gst_va_h265_enc_class_init (gpointer g_klass, gpointer class_data)
       "Application rate control",
       "Control the bitrate in the element and encode in CQP mode",
       FALSE, param_flags);
+
+  /**
+   * GstVaH265Enc:intra-refresh-type:
+   *
+   * Rolling intra refresh: each P picture of a refresh cycle codes a
+   * stripe of columns (vertical) or rows (horizontal) as intra, so the
+   * next complete cycle cleans up after a loss, without I pictures and
+   * their size spikes. That bound holds with b-frames=0 and ref-frames=1.
+   * Temporal motion vector prediction is off while it is on. Disabled
+   * when the driver does not support the type.
+   *
+   * Since: 1.30
+   */
+  properties[PROP_INTRA_REFRESH_TYPE] = g_param_spec_enum
+      ("intra-refresh-type", "Intra refresh type", "Set intra refresh type",
+      GST_TYPE_VA_INTRA_REFRESH_TYPE, VA_ENC_INTRA_REFRESH_NONE,
+      param_flags | GST_PARAM_MUTABLE_PLAYING);
+
+  /**
+   * GstVaH265Enc:intra-refresh-cycle-size:
+   *
+   * The P pictures a refresh cycle takes, at most the columns or rows of
+   * refresh units in the picture (32x32 blocks on iHD). A P picture coded
+   * as a skip picture (see #GstVaH265Enc:skip-repeats) does not count.
+   * 0 takes about a second.
+   *
+   * Since: 1.30
+   */
+  properties[PROP_INTRA_REFRESH_CYCLE_SIZE] = g_param_spec_uint
+      ("intra-refresh-cycle-size", "Intra refresh cycle size",
+      "Set intra refresh cycle size, valid value starts from 2", 0,
+      G_MAXUINT16, 0, param_flags | GST_PARAM_MUTABLE_PLAYING);
+
+  /**
+   * GstVaH265Enc:intra-refresh-qp-delta:
+   *
+   * The QP of the refreshed blocks relative to the picture QP. iHD
+   * clamps it to [-8, 7].
+   *
+   * Since: 1.30
+   */
+  properties[PROP_INTRA_REFRESH_QP_DELTA] = g_param_spec_int
+      ("intra-refresh-qp-delta", "Intra refresh qp delta",
+      "Set intra refresh qp delta", -51, 51, 0,
+      param_flags | GST_PARAM_MUTABLE_PLAYING);
+
+  /**
+   * GstVaH265Enc:intra-refresh-cycle-dist:
+   *
+   * The P pictures from the start of one refresh cycle to the start of
+   * the next. The P pictures between the end of a cycle and the start of
+   * the next refresh nothing. 0, or less than the cycle size, starts
+   * each cycle as the last one ends.
+   *
+   * Since: 1.30
+   */
+  properties[PROP_INTRA_REFRESH_CYCLE_DIST] = g_param_spec_uint
+      ("intra-refresh-cycle-dist", "Intra refresh cycle dist",
+      "Set intra refresh cycle dist", 0, G_MAXUINT16, 0,
+      param_flags | GST_PARAM_MUTABLE_PLAYING);
 
   if (vah265enc_class->rate_control_type > 0) {
     properties[PROP_RATE_CONTROL] = g_param_spec_enum ("rate-control",

@@ -49,6 +49,27 @@ typedef struct
   guint divisor;
 } GstVaCodedRate;
 
+#define GST_TYPE_VA_INTRA_REFRESH_TYPE (gst_va_intra_refresh_type_get_type ())
+
+/* Rolling intra refresh: the P pictures of a cycle each code one stripe
+ * of the picture intra, the stripe moving across the picture, so a cycle
+ * cleans every region once and a lost picture stops showing after it,
+ * without the size spike of an I picture. */
+typedef struct
+{
+  /* VA_ENC_INTRA_REFRESH_ROLLING_COLUMN or _ROW, or 0 when off. */
+  guint32 mode;
+  /* Refresh units (the driver's) along the direction the stripe moves. */
+  guint units;
+  /* P pictures that carry a stripe per cycle, and from the start of one
+   * cycle to the start of the next. */
+  guint cycle_size;
+  guint period;
+  gint qp_delta;
+  /* Where the next P picture stands in the period. */
+  guint index;
+} GstVaIntraRefresh;
+
 struct _GstVaEncFrame
 {
   GstVaEncodePicture *picture;
@@ -167,6 +188,29 @@ gboolean              gst_va_base_enc_add_hrd_parameter   (GstVaBaseEnc * base,
 gboolean              gst_va_base_enc_add_trellis_parameter (GstVaBaseEnc * base,
                                                              GstVaEncodePicture * picture,
                                                              gboolean use_trellis);
+gboolean              gst_va_base_enc_add_intra_refresh_parameter (GstVaBaseEnc * base,
+                                                                   GstVaEncodePicture * picture,
+                                                                   guint32 mode,
+                                                                   guint16 location,
+                                                                   guint16 size,
+                                                                   gint8 qp_delta);
+GType                 gst_va_intra_refresh_type_get_type  (void);
+gboolean              gst_va_intra_refresh_setup          (GstVaIntraRefresh * ir,
+                                                           GstVaBaseEnc * base,
+                                                           guint32 mode,
+                                                           guint cycle_size,
+                                                           guint cycle_dist,
+                                                           gint qp_delta,
+                                                           guint width_units,
+                                                           guint height_units);
+void                  gst_va_intra_refresh_check_gop      (GstVaIntraRefresh * ir,
+                                                           GstVaBaseEnc * base,
+                                                           guint num_bframes,
+                                                           guint num_refs);
+gboolean              gst_va_intra_refresh_add            (GstVaIntraRefresh * ir,
+                                                           GstVaBaseEnc * base,
+                                                           GstVaEncodePicture * picture);
+void                  gst_va_intra_refresh_restart        (GstVaIntraRefresh * ir);
 void                  gst_va_base_enc_add_codec_tag       (GstVaBaseEnc * base,
                                                            const gchar * codec_name);
 void                  gst_va_base_enc_reset_state         (GstVaBaseEnc * base);

@@ -126,6 +126,10 @@ enum
   PROP_CC,
   PROP_SKIP_REPEATS,
   PROP_APP_RATE_CONTROL,
+  PROP_INTRA_REFRESH_TYPE,
+  PROP_INTRA_REFRESH_CYCLE_SIZE,
+  PROP_INTRA_REFRESH_QP_DELTA,
+  PROP_INTRA_REFRESH_CYCLE_DIST,
   /* Must stay last: class_init drops it when rate control is not
    * supported. */
   PROP_RATE_CONTROL,
@@ -194,6 +198,11 @@ struct _GstVaH264Enc
     guint32 target_usage;
     gboolean skip_repeats;
     gboolean app_rc;
+    /* VA_ENC_INTRA_REFRESH_* */
+    guint32 ir_type;
+    guint32 ir_cycle_size;
+    gint32 ir_qp_delta;
+    guint32 ir_cycle_dist;
   } prop;
 
   /* H264 fields */
@@ -310,6 +319,8 @@ struct _GstVaH264Enc
    * keeps the mode the stream is built for. */
   gboolean app_rc;
   GstVaRateControl app_rate_control;
+
+  GstVaIntraRefresh ir;
 };
 
 struct _GstVaH264EncFrame
@@ -746,6 +757,32 @@ _init_app_rate_control (GstVaH264Enc * self)
   GST_INFO_OBJECT (self, "Application rate control: %u bits/s, buffer %.0f "
       "bits, initial QP %u", self->rc.target_bitrate_bits,
       self->app_rate_control.buffer_size, self->app_rate_control.initial_qp);
+}
+
+/* The refresh stripes are counted in macroblocks. A P slice predicts
+ * motion from the current picture only, so a lost picture leaves wrong
+ * pixels but no wrong motion, unlike H.265 with TMVP; the temporal
+ * direct mode exists only in B slices, which carry no refresh. */
+static void
+_ensure_intra_refresh (GstVaH264Enc * self)
+{
+  GstVaBaseEnc *base = GST_VA_BASE_ENC (self);
+  guint32 mode, cycle_size, cycle_dist;
+  gint32 qp_delta;
+
+  GST_OBJECT_LOCK (self);
+  mode = self->prop.ir_type;
+  cycle_size = self->prop.ir_cycle_size;
+  cycle_dist = self->prop.ir_cycle_dist;
+  qp_delta = self->prop.ir_qp_delta;
+  GST_OBJECT_UNLOCK (self);
+
+  if (!gst_va_intra_refresh_setup (&self->ir, base, mode, cycle_size,
+          cycle_dist, qp_delta, self->mb_width, self->mb_height)
+      && mode != VA_ENC_INTRA_REFRESH_NONE) {
+    update_property_uint (base, &self->prop.ir_type,
+        VA_ENC_INTRA_REFRESH_NONE, PROP_INTRA_REFRESH_TYPE);
+  }
 }
 
 /* Derives the level from the currently set limits */
@@ -1759,12 +1796,17 @@ gst_va_h264_enc_reconfig (GstVaBaseEnc * base)
 
   _validate_parameters (self);
 
+  _ensure_intra_refresh (self);
+
   if (!_ensure_rate_control (self))
     return FALSE;
 
   _ensure_app_rate_control (self);
 
   _generate_gop_structure (self);
+
+  gst_va_intra_refresh_check_gop (&self->ir, base, self->gop.num_bframes,
+      self->gop.ref_num_list0);
 
   if (!_calculate_level (self))
     return FALSE;
@@ -3306,6 +3348,17 @@ _encode_one_frame (GstVaH264Enc * self, GstVideoCodecFrame * gst_frame)
     return FALSE;
   if (!_add_picture_parameter (self, frame, &pic_param))
     return FALSE;
+
+  /* A repeat coded as a skip picture never gets here, so it does not
+   * move the refresh: it is not a reference, and the next coded picture
+   * predicts from the same picture as the skip picture did. */
+  if (frame->type == GST_H264_I_SLICE) {
+    gst_va_intra_refresh_restart (&self->ir);
+  } else if (frame->type == GST_H264_P_SLICE
+      && !gst_va_intra_refresh_add (&self->ir, base, frame->base.picture)) {
+    return FALSE;
+  }
+
   _fill_pps (&pic_param, &self->sequence_hdr, &pps);
   self->skip_pps = pps;
   self->skip_pps_valid = TRUE;
@@ -3363,6 +3416,7 @@ gst_va_h264_enc_flush (GstVideoEncoder * venc)
   self->gop.cur_frame_index = 0;
   self->gop.cur_frame_num = 0;
   self->gop.last_keyframe = NULL;
+  gst_va_intra_refresh_restart (&self->ir);
 
   return GST_VIDEO_ENCODER_CLASS (parent_class)->flush (venc);
 }
@@ -3681,6 +3735,10 @@ gst_va_h264_enc_init (GTypeInstance * instance, gpointer g_class)
   self->prop.cc = TRUE;
   self->prop.skip_repeats = FALSE;
   self->prop.app_rc = FALSE;
+  self->prop.ir_type = VA_ENC_INTRA_REFRESH_NONE;
+  self->prop.ir_cycle_size = 0;
+  self->prop.ir_qp_delta = 0;
+  self->prop.ir_cycle_dist = 0;
   self->prop.mbbrc = 0;
   self->prop.bitrate = 0;
   self->prop.target_percentage = 66;
@@ -3770,6 +3828,26 @@ gst_va_h264_enc_set_property (GObject * object, guint prop_id,
       break;
     case PROP_APP_RATE_CONTROL:
       self->prop.app_rc = g_value_get_boolean (value);
+      no_effect = FALSE;
+      g_atomic_int_set (&GST_VA_BASE_ENC (self)->reconf, TRUE);
+      break;
+    case PROP_INTRA_REFRESH_TYPE:
+      self->prop.ir_type = g_value_get_enum (value);
+      no_effect = FALSE;
+      g_atomic_int_set (&GST_VA_BASE_ENC (self)->reconf, TRUE);
+      break;
+    case PROP_INTRA_REFRESH_CYCLE_SIZE:
+      self->prop.ir_cycle_size = g_value_get_uint (value);
+      no_effect = FALSE;
+      g_atomic_int_set (&GST_VA_BASE_ENC (self)->reconf, TRUE);
+      break;
+    case PROP_INTRA_REFRESH_QP_DELTA:
+      self->prop.ir_qp_delta = g_value_get_int (value);
+      no_effect = FALSE;
+      g_atomic_int_set (&GST_VA_BASE_ENC (self)->reconf, TRUE);
+      break;
+    case PROP_INTRA_REFRESH_CYCLE_DIST:
+      self->prop.ir_cycle_dist = g_value_get_uint (value);
       no_effect = FALSE;
       g_atomic_int_set (&GST_VA_BASE_ENC (self)->reconf, TRUE);
       break;
@@ -3893,6 +3971,18 @@ gst_va_h264_enc_get_property (GObject * object, guint prop_id,
       break;
     case PROP_APP_RATE_CONTROL:
       g_value_set_boolean (value, self->prop.app_rc);
+      break;
+    case PROP_INTRA_REFRESH_TYPE:
+      g_value_set_enum (value, self->prop.ir_type);
+      break;
+    case PROP_INTRA_REFRESH_CYCLE_SIZE:
+      g_value_set_uint (value, self->prop.ir_cycle_size);
+      break;
+    case PROP_INTRA_REFRESH_QP_DELTA:
+      g_value_set_int (value, self->prop.ir_qp_delta);
+      break;
+    case PROP_INTRA_REFRESH_CYCLE_DIST:
+      g_value_set_uint (value, self->prop.ir_cycle_dist);
       break;
     case PROP_MBBRC:{
       GstVaFeature mbbrc = GST_VA_FEATURE_AUTO;
@@ -4226,6 +4316,64 @@ gst_va_h264_enc_class_init (gpointer g_klass, gpointer class_data)
       "Application rate control",
       "Control the bitrate in the element and encode in CQP mode",
       FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
+
+  /**
+   * GstVaH264Enc:intra-refresh-type:
+   *
+   * Rolling intra refresh: each P picture of a refresh cycle codes a
+   * stripe of macroblock columns (vertical) or rows (horizontal) as
+   * intra, so the next complete cycle cleans up after a loss, without I
+   * pictures and their size spikes. That bound holds with b-frames=0 and
+   * ref-frames=1. Disabled when the driver does not support the type.
+   *
+   * Since: 1.30
+   */
+  properties[PROP_INTRA_REFRESH_TYPE] = g_param_spec_enum
+      ("intra-refresh-type", "Intra refresh type", "Set intra refresh type",
+      GST_TYPE_VA_INTRA_REFRESH_TYPE, VA_ENC_INTRA_REFRESH_NONE,
+      param_flags | GST_PARAM_MUTABLE_PLAYING);
+
+  /**
+   * GstVaH264Enc:intra-refresh-cycle-size:
+   *
+   * The P pictures a refresh cycle takes, at most the macroblock
+   * columns or rows of the picture. A P picture coded as a skip picture
+   * (see #GstVaH264Enc:skip-repeats) does not count. 0 takes about a
+   * second.
+   *
+   * Since: 1.30
+   */
+  properties[PROP_INTRA_REFRESH_CYCLE_SIZE] = g_param_spec_uint
+      ("intra-refresh-cycle-size", "Intra refresh cycle size",
+      "Set intra refresh cycle size, valid value starts from 2", 0,
+      G_MAXUINT16, 0, param_flags | GST_PARAM_MUTABLE_PLAYING);
+
+  /**
+   * GstVaH264Enc:intra-refresh-qp-delta:
+   *
+   * The QP of the refreshed macroblocks relative to the picture QP.
+   *
+   * Since: 1.30
+   */
+  properties[PROP_INTRA_REFRESH_QP_DELTA] = g_param_spec_int
+      ("intra-refresh-qp-delta", "Intra refresh qp delta",
+      "Set intra refresh qp delta", -51, 51, 0,
+      param_flags | GST_PARAM_MUTABLE_PLAYING);
+
+  /**
+   * GstVaH264Enc:intra-refresh-cycle-dist:
+   *
+   * The P pictures from the start of one refresh cycle to the start of
+   * the next. The P pictures between the end of a cycle and the start of
+   * the next refresh nothing. 0, or less than the cycle size, starts
+   * each cycle as the last one ends.
+   *
+   * Since: 1.30
+   */
+  properties[PROP_INTRA_REFRESH_CYCLE_DIST] = g_param_spec_uint
+      ("intra-refresh-cycle-dist", "Intra refresh cycle dist",
+      "Set intra refresh cycle dist", 0, G_MAXUINT16, 0,
+      param_flags | GST_PARAM_MUTABLE_PLAYING);
 
   /**
    * GstVaH264Enc:mbbrc:

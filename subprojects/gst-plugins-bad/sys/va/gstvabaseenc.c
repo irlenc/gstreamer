@@ -26,6 +26,7 @@
 
 #include "vacompat.h"
 #include "gstvabase.h"
+#include "gstvadisplay_priv.h"
 #include "gstvapluginutils.h"
 
 #define GST_CAT_DEFAULT gst_va_base_enc_debug
@@ -1167,6 +1168,7 @@ gst_va_base_enc_class_init (GstVaBaseEncClass * klass)
   g_object_class_install_properties (gobject_class, N_PROPERTIES, properties);
 
   gst_type_mark_as_plugin_api (GST_TYPE_VA_BASE_ENC, 0);
+  gst_type_mark_as_plugin_api (GST_TYPE_VA_INTRA_REFRESH_TYPE, 0);
 }
 
 /*********************** Helper Functions ****************************/
@@ -1421,6 +1423,180 @@ gst_va_base_enc_add_trellis_parameter (GstVaBaseEnc * base,
   }
 
   return TRUE;
+}
+
+/* The driver takes the refresh as part of the picture state, which it
+ * clears when it parses the picture parameters (iHD does), so this has
+ * to follow the picture parameter buffer, and has to come with every
+ * picture that refreshes. */
+gboolean
+gst_va_base_enc_add_intra_refresh_parameter (GstVaBaseEnc * base,
+    GstVaEncodePicture * picture, guint32 mode, guint16 location,
+    guint16 size, gint8 qp_delta)
+{
+  /* *INDENT-OFF* */
+  struct
+  {
+    VAEncMiscParameterType type;
+    VAEncMiscParameterRIR rir;
+  } rir = {
+    .type = VAEncMiscParameterTypeRIR,
+    .rir.rir_flags.value = mode,
+    .rir.intra_insertion_location = location,
+    .rir.intra_insert_size = size,
+    /* Unsigned in VA, a signed delta to the drivers. */
+    .rir.qp_delta_for_inserted_intra = (guint8) qp_delta,
+  };
+  /* *INDENT-ON* */
+
+  if (!gst_va_encoder_add_param (base->encoder, picture,
+          VAEncMiscParameterBufferType, &rir, sizeof (rir))) {
+    GST_ERROR_OBJECT (base, "Failed to create the intra refresh parameter");
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+/* The values and nicks of the msdk encoders' intra-refresh-type, for the
+ * modes VA has. */
+GType
+gst_va_intra_refresh_type_get_type (void)
+{
+  static gsize type = 0;
+  static const GEnumValue values[] = {
+    {VA_ENC_INTRA_REFRESH_NONE, "No (default)", "no"},
+    {VA_ENC_INTRA_REFRESH_ROLLING_COLUMN, "Vertical", "vertical"},
+    {VA_ENC_INTRA_REFRESH_ROLLING_ROW, "Horizontal", "horizontal"},
+    {0, NULL, NULL},
+  };
+
+  if (g_once_init_enter (&type)) {
+    const GType _type =
+        g_enum_register_static ("GstVaIntraRefreshType", values);
+    g_once_init_leave (&type, _type);
+  }
+  return type;
+}
+
+/* Sets up @ir for the stream the encoder was just configured for, with
+ * @width_units and @height_units the size of the picture in the driver's
+ * refresh units. Returns FALSE when there is no refresh, because none
+ * was asked for or because the driver cannot do @mode. */
+gboolean
+gst_va_intra_refresh_setup (GstVaIntraRefresh * ir, GstVaBaseEnc * base,
+    guint32 mode, guint cycle_size, guint cycle_dist, gint qp_delta,
+    guint width_units, guint height_units)
+{
+  guint32 modes;
+
+  memset (ir, 0, sizeof (*ir));
+
+  if (mode == VA_ENC_INTRA_REFRESH_NONE)
+    return FALSE;
+
+  modes = gst_va_display_get_intra_refresh (base->display, base->profile,
+      GST_VA_BASE_ENC_ENTRYPOINT (base));
+  if (!(modes & mode)) {
+    GST_WARNING_OBJECT (base, "The driver has no %s rolling intra refresh "
+        "(supported: 0x%x), intra refresh disabled",
+        mode == VA_ENC_INTRA_REFRESH_ROLLING_COLUMN ? "vertical" : "horizontal",
+        modes);
+    return FALSE;
+  }
+
+  ir->units = mode == VA_ENC_INTRA_REFRESH_ROLLING_COLUMN ?
+      width_units : height_units;
+  if (ir->units == 0)
+    return FALSE;
+
+  /* About a second by default, as the default key-int-max. */
+  if (cycle_size == 0) {
+    cycle_size = (GST_VIDEO_INFO_FPS_N (&base->in_info)
+        + GST_VIDEO_INFO_FPS_D (&base->in_info) - 1)
+        / GST_VIDEO_INFO_FPS_D (&base->in_info);
+  }
+
+  /* Every picture of a cycle refreshes at least one unit. A picture that
+   * refreshes nothing would break the cycle for iHD, which bounds what
+   * the refreshed region of a picture predicts from by the region its
+   * reference refreshed, and only records that for a picture that
+   * carries a refresh. */
+  if (cycle_size > ir->units) {
+    GST_INFO_OBJECT (base, "Intra refresh cycle of %u pictures is longer "
+        "than the %u units to refresh, lowering it", cycle_size, ir->units);
+  }
+  ir->cycle_size = MIN (MAX (cycle_size, 2), ir->units);
+  ir->period = MAX (cycle_dist, ir->cycle_size);
+  ir->qp_delta = qp_delta;
+  ir->mode = mode;
+
+  GST_INFO_OBJECT (base, "Rolling intra refresh: %s, %u units in %u P "
+      "pictures, one cycle every %u P pictures, QP delta %d",
+      mode == VA_ENC_INTRA_REFRESH_ROLLING_COLUMN ? "vertical" : "horizontal",
+      ir->units, ir->cycle_size, ir->period, ir->qp_delta);
+
+  return TRUE;
+}
+
+/* The refresh cleans the picture only if each picture predicts from the
+ * last one, which the refresh cleaned up to where the new stripe starts.
+ * iHD rejects the refresh on an H.265 B picture that is not low delay,
+ * so B pictures carry none, and more than one reference lets the first
+ * pictures of a cycle predict from the pictures of the cycle before,
+ * where a loss may not be cleaned yet. */
+void
+gst_va_intra_refresh_check_gop (GstVaIntraRefresh * ir, GstVaBaseEnc * base,
+    guint num_bframes, guint num_refs)
+{
+  if (!ir->mode)
+    return;
+
+  if (num_bframes > 0) {
+    GST_WARNING_OBJECT (base, "Intra refresh with B frames: B pictures "
+        "refresh nothing and can carry a loss past a refreshed region, use "
+        "b-frames=0");
+  }
+
+  if (num_refs > 1) {
+    GST_WARNING_OBJECT (base, "Intra refresh with %u reference frames: a "
+        "loss can outlive the next refresh cycle, use ref-frames=1", num_refs);
+  }
+}
+
+/* For a P picture the hardware codes, after its picture parameters.
+ * The stripes of a cycle split the units evenly, so the cycle takes
+ * exactly cycle_size pictures. iHD hands the H.264 size to VDEnc as the
+ * size minus one, so there each stripe is a macroblock wider than asked:
+ * stripes overlap by one, and still cover every unit. */
+gboolean
+gst_va_intra_refresh_add (GstVaIntraRefresh * ir, GstVaBaseEnc * base,
+    GstVaEncodePicture * picture)
+{
+  guint start, end;
+
+  if (!ir->mode)
+    return TRUE;
+
+  if (ir->index < ir->cycle_size) {
+    start = ir->index * ir->units / ir->cycle_size;
+    end = (ir->index + 1) * ir->units / ir->cycle_size;
+    g_assert (end > start);
+
+    if (!gst_va_base_enc_add_intra_refresh_parameter (base, picture,
+            ir->mode, start, end - start, ir->qp_delta))
+      return FALSE;
+  }
+
+  ir->index = (ir->index + 1) % ir->period;
+  return TRUE;
+}
+
+/* An I picture is clean as a whole, the next cycle starts after it. */
+void
+gst_va_intra_refresh_restart (GstVaIntraRefresh * ir)
+{
+  ir->index = 0;
 }
 
 void
