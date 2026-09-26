@@ -53,6 +53,9 @@ guint32               gst_va_display_get_rate_control_mode
 guint32               gst_va_display_get_quality_level    (GstVaDisplay * self,
                                                            VAProfile profile,
                                                            VAEntrypoint entrypoint);
+guint32               gst_va_display_get_intra_refresh    (GstVaDisplay * self,
+                                                           VAProfile profile,
+                                                           VAEntrypoint entrypoint);
 gboolean              gst_va_display_has_trellis          (GstVaDisplay * self,
                                                            VAProfile profile,
                                                            VAEntrypoint entrypoint);

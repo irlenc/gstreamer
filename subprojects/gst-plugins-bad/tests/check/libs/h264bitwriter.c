@@ -523,6 +523,67 @@ GST_START_TEST (test_h264_bitwriter_sei)
 
 GST_END_TEST;
 
+GST_START_TEST (test_h264_bitwriter_sei_recovery_point)
+{
+  GstH264ParserResult res;
+  GstH264NalUnit nalu;
+  GstH264SEIMessage sei_msg = { 0, };
+  GstH264SEIMessage *parsed;
+  GstH264BitWriterResult ret;
+  GstH264SPS sps_parsed;
+  GstH264NalParser *const parser = gst_h264_nal_parser_new ();
+  GArray *msg_array, *sei_parsed = NULL;
+  guint size, size_nal;
+  guint8 sei_data[64] = { 0, };
+  guint8 sei_nal[64] = { 0, };
+
+  /* The recovery point SEI is parsed against the active SPS. */
+  res = gst_h264_parser_identify_nalu (parser, nalu_sps, 0, sizeof (nalu_sps),
+      &nalu);
+  assert_equals_int (res, GST_H264_PARSER_NO_NAL_END);
+  res = gst_h264_parser_parse_sps (parser, &nalu, &sps_parsed);
+  assert_equals_int (res, GST_H264_PARSER_OK);
+
+  msg_array = g_array_new (FALSE, FALSE, sizeof (GstH264SEIMessage));
+  sei_msg.payloadType = GST_H264_SEI_RECOVERY_POINT;
+  sei_msg.payload.recovery_point.recovery_frame_cnt = 7;
+  sei_msg.payload.recovery_point.exact_match_flag = 0;
+  sei_msg.payload.recovery_point.broken_link_flag = 1;
+  sei_msg.payload.recovery_point.changing_slice_group_idc = 0;
+  g_array_append_val (msg_array, sei_msg);
+
+  size = sizeof (sei_data);
+  ret = gst_h264_bit_writer_sei (msg_array, TRUE, sei_data, &size);
+  fail_if (ret != GST_H264_BIT_WRITER_OK);
+
+  size_nal = sizeof (sei_nal);
+  ret = gst_h264_bit_writer_convert_to_nal (4, FALSE, TRUE, FALSE,
+      sei_data, size * 8, sei_nal, &size_nal);
+  fail_if (ret != GST_H264_BIT_WRITER_OK);
+
+  /* Parse it again. */
+  res = gst_h264_parser_identify_nalu (parser, sei_nal, 0,
+      sizeof (sei_nal), &nalu);
+  assert_equals_int (res, GST_H264_PARSER_NO_NAL_END);
+  res = gst_h264_parser_parse_sei (parser, &nalu, &sei_parsed);
+  assert_equals_int (res, GST_H264_PARSER_OK);
+  assert_equals_int (sei_parsed->len, 1);
+
+  parsed = &g_array_index (sei_parsed, GstH264SEIMessage, 0);
+  assert_equals_int (parsed->payloadType, GST_H264_SEI_RECOVERY_POINT);
+  assert_equals_int (parsed->payload.recovery_point.recovery_frame_cnt, 7);
+  assert_equals_int (parsed->payload.recovery_point.exact_match_flag, 0);
+  assert_equals_int (parsed->payload.recovery_point.broken_link_flag, 1);
+  assert_equals_int (parsed->payload.recovery_point.changing_slice_group_idc,
+      0);
+
+  g_array_unref (sei_parsed);
+  g_array_unref (msg_array);
+  gst_h264_nal_parser_free (parser);
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_h264_bitwriter_filler)
 {
   GstH264ParserResult res;
@@ -565,6 +626,7 @@ h264bitwriter_suite (void)
   suite_add_tcase (s, tc_chain);
   tcase_add_test (tc_chain, test_h264_bitwriter_sps_pps_slice_hdr);
   tcase_add_test (tc_chain, test_h264_bitwriter_sei);
+  tcase_add_test (tc_chain, test_h264_bitwriter_sei_recovery_point);
   tcase_add_test (tc_chain, test_h264_bitwriter_filler);
 
   return s;

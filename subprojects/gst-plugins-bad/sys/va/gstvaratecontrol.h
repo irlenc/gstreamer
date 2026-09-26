@@ -60,6 +60,9 @@ typedef struct
   /* Encoder buffer fullness in bits. Pictures whose coded size is not
    * known yet count with their predicted size. */
   gdouble fullness;
+  /* The part of the fullness that is still predictions, at the current
+   * P complexity. */
+  gdouble in_flight;
   /* log2 of c in bits = c * 2^(-qp / 6) for a P picture, and of the
    * cost of the other frame types relative to it. */
   gdouble log_complexity_p;

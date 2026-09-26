@@ -304,6 +304,21 @@ gst_va_display_get_quality_level (GstVaDisplay * self,
   return attrib.value;
 }
 
+/* The VA_ENC_INTRA_REFRESH_* modes the driver does, 0 for none */
+guint32
+gst_va_display_get_intra_refresh (GstVaDisplay * self,
+    VAProfile profile, VAEntrypoint entrypoint)
+{
+  VAConfigAttrib attrib;
+
+  g_return_val_if_fail (GST_IS_VA_DISPLAY (self), 0);
+
+  if (_get_config_attrib (VAConfigAttribEncIntraRefresh) < 1)
+    return 0;
+
+  return attrib.value;
+}
+
 gboolean
 gst_va_display_has_trellis (GstVaDisplay * self,
     VAProfile profile, VAEntrypoint entrypoint)

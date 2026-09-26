@@ -1354,6 +1354,29 @@ error:
 }
 
 static gboolean
+_h264_bit_writer_sei_recovery_point (const GstH264RecoveryPoint * rp,
+    GstBitWriter * bw, gboolean * space)
+{
+  gboolean have_space = TRUE;
+
+  GST_DEBUG ("Writing \"Recovery point\"");
+
+  WRITE_UE (bw, rp->recovery_frame_cnt);
+  WRITE_BITS (bw, rp->exact_match_flag, 1);
+  WRITE_BITS (bw, rp->broken_link_flag, 1);
+  WRITE_BITS (bw, rp->changing_slice_group_idc, 2);
+
+  *space = TRUE;
+  return TRUE;
+
+error:
+  GST_WARNING ("Failed to write \"Recovery point\"");
+
+  *space = have_space;
+  return FALSE;
+}
+
+static gboolean
 _h264_bit_writer_sei_message (const GstH264SEIMessage * msg,
     GstBitWriter * bw, gboolean * space)
 {
@@ -1375,6 +1398,11 @@ _h264_bit_writer_sei_message (const GstH264SEIMessage * msg,
     case GST_H264_SEI_MASTERING_DISPLAY_COLOUR_VOLUME:
       if (!_h264_bit_writer_sei_mastering_display_colour_volume
           (&msg->payload.mastering_display_colour_volume, bw, &have_space))
+        goto error;
+      break;
+    case GST_H264_SEI_RECOVERY_POINT:
+      if (!_h264_bit_writer_sei_recovery_point
+          (&msg->payload.recovery_point, bw, &have_space))
         goto error;
       break;
     case GST_H264_SEI_CONTENT_LIGHT_LEVEL:
