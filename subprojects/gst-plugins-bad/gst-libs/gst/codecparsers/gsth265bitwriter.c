@@ -1995,6 +1995,28 @@ error:
 }
 
 static gboolean
+_h265_bit_writer_sei_recovery_point (const GstH265RecoveryPoint * rp,
+    GstBitWriter * bw, gboolean * space)
+{
+  gboolean have_space = TRUE;
+
+  GST_DEBUG ("Writing \"Recovery point\"");
+
+  WRITE_SE (bw, rp->recovery_poc_cnt);
+  WRITE_BITS (bw, rp->exact_match_flag, 1);
+  WRITE_BITS (bw, rp->broken_link_flag, 1);
+
+  *space = TRUE;
+  return TRUE;
+
+error:
+  GST_WARNING ("Failed to write \"Recovery point\"");
+
+  *space = have_space;
+  return FALSE;
+}
+
+static gboolean
 _h265_bit_writer_sei_message (const GstH265SEIMessage * msg,
     GstBitWriter * bw, gboolean * space)
 {
@@ -2016,6 +2038,11 @@ _h265_bit_writer_sei_message (const GstH265SEIMessage * msg,
     case GST_H265_SEI_MASTERING_DISPLAY_COLOUR_VOLUME:
       if (!_h265_bit_writer_sei_mastering_display_colour_volume
           (&msg->payload.mastering_display_colour_volume, bw, &have_space))
+        goto error;
+      break;
+    case GST_H265_SEI_RECOVERY_POINT:
+      if (!_h265_bit_writer_sei_recovery_point
+          (&msg->payload.recovery_point, bw, &have_space))
         goto error;
       break;
     case GST_H265_SEI_CONTENT_LIGHT_LEVEL:
@@ -2063,6 +2090,7 @@ gst_h265_bit_writer_sei (GArray * sei_messages,
 {
   gboolean have_space = TRUE;
   GstBitWriter bw;
+  GstBitWriter bw_msg;
   GstH265SEIMessage *sei;
   gboolean have_written_data = FALSE;
   guint i;
@@ -2074,11 +2102,7 @@ gst_h265_bit_writer_sei (GArray * sei_messages,
   g_return_val_if_fail (size != NULL, GST_H265_BIT_WRITER_ERROR);
   g_return_val_if_fail (*size > 0, GST_H265_BIT_WRITER_ERROR);
 
-  if (nal_type == GST_H265_NAL_PREFIX_SEI) {
-    GST_WARNING ("prefix sei is not supported");
-    return GST_H265_BIT_WRITER_ERROR;
-  }
-
+  gst_bit_writer_init (&bw_msg);
   gst_bit_writer_init_with_data (&bw, data, *size, FALSE);
 
   if (start_code)
@@ -2097,43 +2121,43 @@ gst_h265_bit_writer_sei (GArray * sei_messages,
   for (i = 0; i < sei_messages->len; i++) {
     guint32 payload_size_data;
     guint32 payload_type_data;
-
-    gst_bit_writer_init (&bw);
+    guint32 sz;
 
     sei = &g_array_index (sei_messages, GstH265SEIMessage, i);
-    if (!_h265_bit_writer_sei_message (sei, &bw, &have_space))
+    if (!_h265_bit_writer_sei_message (sei, &bw_msg, &have_space))
       goto error;
 
-    if (gst_bit_writer_get_size (&bw) == 0) {
+    if (gst_bit_writer_get_size (&bw_msg) == 0) {
       GST_FIXME ("Unsupported SEI type %d", sei->payloadType);
       continue;
     }
 
     have_written_data = TRUE;
 
-    g_assert (gst_bit_writer_get_size (&bw) % 8 == 0);
-    payload_size_data = (gst_bit_writer_get_size (&bw) + 7) / 8;
+    g_assert (gst_bit_writer_get_size (&bw_msg) % 8 == 0);
+    payload_size_data = gst_bit_writer_get_size (&bw_msg) / 8;
     payload_type_data = sei->payloadType;
 
     /* write payload type bytes */
     while (payload_type_data >= 0xff) {
       WRITE_BITS (&bw, 0xff, 8);
-      payload_type_data -= -0xff;
+      payload_type_data -= 0xff;
     }
     WRITE_BITS (&bw, payload_type_data, 8);
 
     /* write payload size bytes */
-    while (payload_size_data >= 0xff) {
+    sz = payload_size_data;
+    while (sz >= 0xff) {
       WRITE_BITS (&bw, 0xff, 8);
-      payload_size_data -= -0xff;
+      sz -= 0xff;
     }
-    WRITE_BITS (&bw, payload_size_data, 8);
+    WRITE_BITS (&bw, sz, 8);
 
-    if (gst_bit_writer_get_size (&bw) / 8)
-      WRITE_BYTES (&bw, gst_bit_writer_get_data (&bw),
-          gst_bit_writer_get_size (&bw) / 8);
+    if (payload_size_data > 0)
+      WRITE_BYTES (&bw, gst_bit_writer_get_data (&bw_msg), payload_size_data);
 
-    gst_bit_writer_reset (&bw);
+    gst_bit_writer_reset (&bw_msg);
+    gst_bit_writer_init (&bw_msg);
   }
 
   if (!have_written_data) {
@@ -2153,6 +2177,7 @@ gst_h265_bit_writer_sei (GArray * sei_messages,
   return GST_H265_BIT_WRITER_OK;
 
 error:
+  gst_bit_writer_reset (&bw_msg);
   gst_bit_writer_reset (&bw);
   *size = 0;
 

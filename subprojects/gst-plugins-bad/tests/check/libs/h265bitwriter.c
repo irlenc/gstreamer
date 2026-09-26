@@ -946,6 +946,104 @@ GST_START_TEST (test_h265_bitwriter_vps_sps_pps_slice_hdr)
 }
 
 GST_END_TEST;
+GST_START_TEST (test_h265_bitwriter_sei)
+{
+  GstH265ParserResult res;
+  GstH265BitWriterResult ret;
+  GstH265Parser *const parser = gst_h265_parser_new ();
+  GstH265VPS vps_parsed;
+  GstH265SPS sps_parsed;
+  GstH265SEIMessage sei_msg = { 0, };
+  GstH265SEIMessage *parsed;
+  GArray *msg_array, *sei_parsed = NULL;
+  guint size, nal_size;
+  guint8 header_data[2048] = { 0, };
+  guint8 header_nal[2048] = { 0, };
+  GstH265NalUnit nalu;
+
+  /* The recovery point SEI is parsed against the active SPS. */
+  size = sizeof (header_data);
+  ret = gst_h265_bit_writer_vps (&vps, TRUE, header_data, &size);
+  fail_if (ret != GST_H265_BIT_WRITER_OK);
+  nal_size = sizeof (header_nal);
+  ret = gst_h265_bit_writer_convert_to_nal (4, FALSE, TRUE, FALSE,
+      header_data, size * 8, header_nal, &nal_size);
+  fail_if (ret != GST_H265_BIT_WRITER_OK);
+  res = gst_h265_parser_identify_nalu (parser, header_nal, 0,
+      sizeof (header_nal), &nalu);
+  assert_equals_int (res, GST_H265_PARSER_NO_NAL_END);
+  res = gst_h265_parser_parse_vps (parser, &nalu, &vps_parsed);
+  assert_equals_int (res, GST_H265_PARSER_OK);
+
+  memset (header_data, 0, sizeof (header_data));
+  memset (header_nal, 0, sizeof (header_nal));
+  size = sizeof (header_data);
+  ret = gst_h265_bit_writer_sps (&sps, TRUE, header_data, &size);
+  fail_if (ret != GST_H265_BIT_WRITER_OK);
+  nal_size = sizeof (header_nal);
+  ret = gst_h265_bit_writer_convert_to_nal (4, FALSE, TRUE, FALSE,
+      header_data, size * 8, header_nal, &nal_size);
+  fail_if (ret != GST_H265_BIT_WRITER_OK);
+  res = gst_h265_parser_identify_nalu (parser, header_nal, 0,
+      sizeof (header_nal), &nalu);
+  assert_equals_int (res, GST_H265_PARSER_NO_NAL_END);
+  res = gst_h265_parser_parse_sps (parser, &nalu, &sps_parsed, TRUE);
+  assert_equals_int (res, GST_H265_PARSER_OK);
+
+  /* Two messages in one prefix SEI, so the second is written after the
+   * first rather than over it. */
+  msg_array = g_array_new (FALSE, FALSE, sizeof (GstH265SEIMessage));
+  sei_msg.payloadType = GST_H265_SEI_RECOVERY_POINT;
+  sei_msg.payload.recovery_point.recovery_poc_cnt = 29;
+  sei_msg.payload.recovery_point.exact_match_flag = 0;
+  sei_msg.payload.recovery_point.broken_link_flag = 1;
+  g_array_append_val (msg_array, sei_msg);
+  memset (&sei_msg, 0, sizeof (sei_msg));
+  sei_msg.payloadType = GST_H265_SEI_CONTENT_LIGHT_LEVEL;
+  sei_msg.payload.content_light_level.max_content_light_level = 1000;
+  sei_msg.payload.content_light_level.max_pic_average_light_level = 400;
+  g_array_append_val (msg_array, sei_msg);
+
+  memset (header_data, 0, sizeof (header_data));
+  memset (header_nal, 0, sizeof (header_nal));
+  size = sizeof (header_data);
+  ret = gst_h265_bit_writer_sei (msg_array, GST_H265_NAL_PREFIX_SEI, TRUE,
+      header_data, &size);
+  fail_if (ret != GST_H265_BIT_WRITER_OK);
+  nal_size = sizeof (header_nal);
+  ret = gst_h265_bit_writer_convert_to_nal (4, FALSE, TRUE, FALSE,
+      header_data, size * 8, header_nal, &nal_size);
+  fail_if (ret != GST_H265_BIT_WRITER_OK);
+
+  /* Parse it again */
+  res = gst_h265_parser_identify_nalu (parser, header_nal, 0,
+      sizeof (header_nal), &nalu);
+  assert_equals_int (res, GST_H265_PARSER_NO_NAL_END);
+  assert_equals_int (nalu.type, GST_H265_NAL_PREFIX_SEI);
+  res = gst_h265_parser_parse_sei (parser, &nalu, &sei_parsed);
+  assert_equals_int (res, GST_H265_PARSER_OK);
+  assert_equals_int (sei_parsed->len, 2);
+
+  parsed = &g_array_index (sei_parsed, GstH265SEIMessage, 0);
+  assert_equals_int (parsed->payloadType, GST_H265_SEI_RECOVERY_POINT);
+  assert_equals_int (parsed->payload.recovery_point.recovery_poc_cnt, 29);
+  assert_equals_int (parsed->payload.recovery_point.exact_match_flag, 0);
+  assert_equals_int (parsed->payload.recovery_point.broken_link_flag, 1);
+
+  parsed = &g_array_index (sei_parsed, GstH265SEIMessage, 1);
+  assert_equals_int (parsed->payloadType, GST_H265_SEI_CONTENT_LIGHT_LEVEL);
+  assert_equals_int (parsed->payload.content_light_level.
+      max_content_light_level, 1000);
+  assert_equals_int (parsed->payload.content_light_level.
+      max_pic_average_light_level, 400);
+
+  g_array_unref (sei_parsed);
+  g_array_unref (msg_array);
+  gst_h265_parser_free (parser);
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_h265_bitwriter_filler)
 {
   GstH265ParserResult res;
@@ -987,6 +1085,7 @@ h265bitwriter_suite (void)
 
   suite_add_tcase (s, tc_chain);
   tcase_add_test (tc_chain, test_h265_bitwriter_vps_sps_pps_slice_hdr);
+  tcase_add_test (tc_chain, test_h265_bitwriter_sei);
   tcase_add_test (tc_chain, test_h265_bitwriter_filler);
 
   return s;
