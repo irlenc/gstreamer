@@ -274,6 +274,10 @@ struct _GstVaCompositor
   guint32 memo_interpolation_method;
   guint32 memo_background_color;
   GstBuffer *memo_output;
+  /* Bumped by every reset. A pad can be requested or released on another
+   * thread while a composition is in flight, and the composition must not
+   * be remembered past the reset that pad change made. */
+  guint memo_generation;
 };
 
 typedef struct
@@ -424,6 +428,7 @@ gst_va_compositor_memo_reset (GstVaCompositor * self)
   if (self->memo)
     g_array_set_size (self->memo, 0);
   gst_clear_buffer (&self->memo_output);
+  self->memo_generation++;
 }
 
 static gboolean
@@ -1334,9 +1339,9 @@ gst_va_compositor_memo_matches (GstVaCompositor * self, GArray * snapshot)
  * reference (which an encoder can skip) and the GPU does no work. */
 static gboolean
 gst_va_compositor_reuse_output (GstVaCompositor * self, GstBuffer * outbuf,
-    GArray ** snapshot)
+    GArray ** snapshot, guint * generation)
 {
-  gboolean reuse;
+  GstBuffer *memo_output = NULL;
 
   GST_OBJECT_LOCK (self);
   if (!self->skip_unchanged || self->other_pool) {
@@ -1345,17 +1350,21 @@ gst_va_compositor_reuse_output (GstVaCompositor * self, GstBuffer * outbuf,
   }
 
   *snapshot = gst_va_compositor_memo_snapshot (self);
-  reuse = gst_va_compositor_memo_matches (self, *snapshot);
+  *generation = self->memo_generation;
+  /* The reference is taken under the lock: a pad change on another
+   * thread resets the memo, and would otherwise leave nothing to copy. */
+  if (gst_va_compositor_memo_matches (self, *snapshot))
+    memo_output = gst_buffer_ref (self->memo_output);
   GST_OBJECT_UNLOCK (self);
 
-  if (!reuse)
+  if (!memo_output)
     return FALSE;
 
   /* Removing the memory tags the buffer, so its pool frees it instead of
    * recycling it, and the shared memory stays with the memo. */
   gst_buffer_remove_all_memory (outbuf);
-  gst_buffer_copy_into (outbuf, self->memo_output, GST_BUFFER_COPY_MEMORY, 0,
-      -1);
+  gst_buffer_copy_into (outbuf, memo_output, GST_BUFFER_COPY_MEMORY, 0, -1);
+  gst_buffer_unref (memo_output);
 
   g_clear_pointer (snapshot, g_array_unref);
   return TRUE;
@@ -1470,9 +1479,14 @@ gst_va_compositor_pass_single_pad (GstVaCompositor * self, GstBuffer * outbuf)
 
 static void
 gst_va_compositor_memo_store (GstVaCompositor * self, GArray * snapshot,
-    GstBuffer * outbuf)
+    GstBuffer * outbuf, guint generation)
 {
   GST_OBJECT_LOCK (self);
+  if (generation != self->memo_generation) {
+    GST_OBJECT_UNLOCK (self);
+    g_array_unref (snapshot);
+    return;
+  }
   if (self->memo)
     g_array_unref (self->memo);
   self->memo = snapshot;
@@ -1495,6 +1509,7 @@ gst_va_compositor_aggregate_frames (GstVideoAggregator * vagg,
   gboolean have_sample;
   GstFlowReturn ret = GST_FLOW_OK;
   GArray *snapshot = NULL;
+  guint generation = 0;
 
   GST_OBJECT_LOCK (self);
   have_sample = gst_va_compositor_has_sample (self);
@@ -1511,7 +1526,8 @@ gst_va_compositor_aggregate_frames (GstVideoAggregator * vagg,
     return GST_FLOW_OK;
   }
 
-  if (gst_va_compositor_reuse_output (self, outbuf, &snapshot)) {
+  if (gst_va_compositor_reuse_output (self, outbuf, &snapshot,
+          &generation)) {
     GST_LOG_OBJECT (self, "inputs unchanged, repeating the last output");
     return GST_FLOW_OK;
   }
@@ -1519,7 +1535,7 @@ gst_va_compositor_aggregate_frames (GstVideoAggregator * vagg,
   if (gst_va_compositor_pass_single_pad (self, outbuf)) {
     GST_LOG_OBJECT (self, "one opaque full canvas pad, passing it through");
     if (snapshot)
-      gst_va_compositor_memo_store (self, snapshot, outbuf);
+      gst_va_compositor_memo_store (self, snapshot, outbuf, generation);
     return GST_FLOW_OK;
   }
 
@@ -1578,7 +1594,7 @@ gst_va_compositor_aggregate_frames (GstVideoAggregator * vagg,
   }
 
   if (snapshot) {
-    gst_va_compositor_memo_store (self, snapshot, outbuf);
+    gst_va_compositor_memo_store (self, snapshot, outbuf, generation);
     snapshot = NULL;
   }
 
