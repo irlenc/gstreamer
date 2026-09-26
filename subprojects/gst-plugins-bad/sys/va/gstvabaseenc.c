@@ -1599,6 +1599,15 @@ gst_va_intra_refresh_restart (GstVaIntraRefresh * ir)
   ir->index = 0;
 }
 
+/* Whether the next P picture refreshes the first stripe of a cycle: the
+ * picture a decoder can start from, or recover from a loss at, without
+ * waiting for an IDR. */
+gboolean
+gst_va_intra_refresh_cycle_starts (const GstVaIntraRefresh * ir)
+{
+  return ir->mode && ir->index == 0;
+}
+
 /* The smallest cpb-size, in kbits, that is not taken as a mistake and
  * replaced by the default. An I picture costs several average pictures,
  * so without intra refresh the CPB is kept at half a second or more.

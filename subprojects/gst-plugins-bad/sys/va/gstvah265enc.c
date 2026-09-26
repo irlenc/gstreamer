@@ -1921,6 +1921,59 @@ _poc_des_compare (const GstVaH265EncFrame ** a, const GstVaH265EncFrame ** b)
   return (*b)->poc - (*a)->poc;
 }
 
+/* Makes a P picture that starts an intra refresh cycle a point a decoder
+ * can start from: the parameter sets, which only IRAP pictures carry
+ * otherwise, and a recovery point SEI. Without the SEI a decoder that
+ * lost a reference refuses every picture until the next IRAP, since
+ * each one predicts from a picture it dropped. The match is
+ * approximate: motion can carry damage from the part not yet refreshed
+ * into the part that is, and it fades over the next cycle. The
+ * parameter sets are repeated only where gstva writes them itself, as
+ * only those describe the stream. */
+static void
+_h265_add_recovery_point (GstVaH265Enc * self, GstVaH265EncFrame * frame,
+    GstH265PPS * pps)
+{
+  GstVaBaseEnc *base = GST_VA_BASE_ENC (self);
+  guint8 packed_sei[32] = { 0, };
+  guint sei_size = sizeof (packed_sei);
+  GArray *msg_list;
+  GstH265SEIMessage *msg;
+  GstH265BitWriterResult ret;
+
+  if (!(self->packed_headers & VA_ENC_PACKED_HEADER_RAW_DATA))
+    return;
+
+  if ((self->packed_headers & VA_ENC_PACKED_HEADER_SEQUENCE)
+      && (self->packed_headers & VA_ENC_PACKED_HEADER_PICTURE)
+      && (!_h265_add_vps_header (self, frame)
+          || !_h265_add_sps_header (self, frame)
+          || !_h265_add_pps_header (self, frame, pps))) {
+    GST_WARNING_OBJECT (self, "Failed to add the recovery point headers");
+    return;
+  }
+
+  msg_list = g_array_sized_new (FALSE, TRUE, sizeof (GstH265SEIMessage), 1);
+  g_array_set_size (msg_list, 1);
+  msg = &g_array_index (msg_list, GstH265SEIMessage, 0);
+  msg->payloadType = GST_H265_SEI_RECOVERY_POINT;
+  /* A POC distance. Skip pictures take POCs too, so a cycle with repeats
+   * in it reaches this POC before its last stripe, which only makes the
+   * approximate match more approximate. It stays below half the POC LSB
+   * range (D.3.8), which a cycle longer than the IDR period would pass:
+   * the IDR recovers such a stream first anyway. */
+  msg->payload.recovery_point.recovery_poc_cnt =
+      MIN (self->ir.cycle_size - 1, self->gop.max_pic_order_cnt / 2 - 1);
+  ret = gst_h265_bit_writer_sei (msg_list, GST_H265_NAL_PREFIX_SEI, TRUE,
+      packed_sei, &sei_size);
+  g_array_unref (msg_list);
+
+  if (ret != GST_H265_BIT_WRITER_OK
+      || !gst_va_encoder_add_packed_header (base->encoder, frame->base.picture,
+          VAEncPackedHeaderRawData, packed_sei, sei_size * 8, FALSE))
+    GST_WARNING_OBJECT (self, "Failed to add the recovery point SEI");
+}
+
 static gboolean
 _h265_encode_one_frame (GstVaH265Enc * self, GstVideoCodecFrame * gst_frame)
 {
@@ -1938,6 +1991,7 @@ _h265_encode_one_frame (GstVaH265Enc * self, GstVideoCodecFrame * gst_frame)
   guint num_positive_pics = 0;
   gint collocated_poc = -1;
   gint i;
+  gboolean recovery_point = FALSE;
 
   g_return_val_if_fail (gst_frame, FALSE);
 
@@ -2118,9 +2172,10 @@ _h265_encode_one_frame (GstVaH265Enc * self, GstVideoCodecFrame * gst_frame)
    * B picture keeps the P type here and refreshes as one. */
   if (frame->type == GST_H265_I_SLICE) {
     gst_va_intra_refresh_restart (&self->ir);
-  } else if (frame->type == GST_H265_P_SLICE
-      && !gst_va_intra_refresh_add (&self->ir, base, frame->base.picture)) {
-    return FALSE;
+  } else if (frame->type == GST_H265_P_SLICE) {
+    recovery_point = gst_va_intra_refresh_cycle_starts (&self->ir);
+    if (!gst_va_intra_refresh_add (&self->ir, base, frame->base.picture))
+      return FALSE;
   }
 
   _h265_fill_pps (self, &pic_param, &self->sps_hdr, &pps);
@@ -2136,6 +2191,10 @@ _h265_encode_one_frame (GstVaH265Enc * self, GstVideoCodecFrame * gst_frame)
       self->skip_pps_valid = TRUE;
     }
   }
+
+  /* Not fatal: without it a decoder waits for the next IRAP. */
+  if (recovery_point)
+    _h265_add_recovery_point (self, frame, &pps);
 
   if (!_h265_add_slices (self, frame, &pps,
           list_forward, list_forward_num, list_backward, list_backward_num,
@@ -5053,6 +5112,13 @@ gst_va_h265_enc_reconfig (GstVaBaseEnc * base)
 
   /* Before the rate control: the CPB can be smaller with it. */
   _h265_ensure_intra_refresh (self);
+  /* Intra refresh is for a link whose buffer holds a few pictures, and
+   * pictures queued in the driver add their latency on top of it. The
+   * rate control also has to see each coded size before it decides the
+   * next picture: a buffer of a few pictures has no room for a queue of
+   * predictions. */
+  if (self->ir.mode)
+    base->preferred_output_delay = 0;
 
   if (!_h265_ensure_rate_control (self))
     return FALSE;

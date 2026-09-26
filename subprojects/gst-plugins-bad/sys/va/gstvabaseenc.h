@@ -211,6 +211,7 @@ gboolean              gst_va_intra_refresh_add            (GstVaIntraRefresh * i
                                                            GstVaBaseEnc * base,
                                                            GstVaEncodePicture * picture);
 void                  gst_va_intra_refresh_restart        (GstVaIntraRefresh * ir);
+gboolean              gst_va_intra_refresh_cycle_starts   (const GstVaIntraRefresh * ir);
 guint                 gst_va_base_enc_min_cpb_size        (GstVaBaseEnc * base,
                                                            guint max_bitrate,
                                                            gboolean intra_refresh);

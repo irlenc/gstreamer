@@ -1800,6 +1800,13 @@ gst_va_h264_enc_reconfig (GstVaBaseEnc * base)
 
   /* Before the rate control: the CPB can be smaller with it. */
   _ensure_intra_refresh (self);
+  /* Intra refresh is for a link whose buffer holds a few pictures, and
+   * pictures queued in the driver add their latency on top of it. The
+   * rate control also has to see each coded size before it decides the
+   * next picture: a buffer of a few pictures has no room for a queue of
+   * predictions. */
+  if (self->ir.mode)
+    base->preferred_output_delay = 0;
 
   if (!_ensure_rate_control (self))
     return FALSE;
@@ -3204,6 +3211,55 @@ out:
     g_free (packed_sei);
 }
 
+/* Makes a P picture that starts an intra refresh cycle a point a decoder
+ * can start from: the parameter sets, which only IDR pictures carry
+ * otherwise, and a recovery point SEI. The SEI is what lets a decoder
+ * that lost a reference, or joined after the IDR, decode on instead of
+ * dropping pictures until the next IDR. The match is approximate:
+ * motion can carry damage from the part not yet refreshed into the part
+ * that is, and it fades over the next cycle. The parameter sets are
+ * repeated only where gstva writes them itself, as only those describe
+ * the stream. */
+static void
+_add_recovery_point (GstVaH264Enc * self, GstVaH264EncFrame * frame,
+    GstH264PPS * pps)
+{
+  GstVaBaseEnc *base = GST_VA_BASE_ENC (self);
+  guint8 packed_sei[32] = { 0, };
+  guint sei_size = sizeof (packed_sei);
+  GArray *msg_list;
+  GstH264SEIMessage *msg;
+  GstH264BitWriterResult ret;
+
+  if (!(self->packed_headers & VA_ENC_PACKED_HEADER_RAW_DATA))
+    return;
+
+  if ((self->packed_headers & VA_ENC_PACKED_HEADER_SEQUENCE)
+      && (self->packed_headers & VA_ENC_PACKED_HEADER_PICTURE)
+      && (!_add_sequence_header (self, frame)
+          || !_add_picture_header (self, frame, pps))) {
+    GST_WARNING_OBJECT (self, "Failed to add the recovery point headers");
+    return;
+  }
+
+  msg_list = g_array_sized_new (FALSE, TRUE, sizeof (GstH264SEIMessage), 1);
+  g_array_set_size (msg_list, 1);
+  msg = &g_array_index (msg_list, GstH264SEIMessage, 0);
+  msg->payloadType = GST_H264_SEI_RECOVERY_POINT;
+  /* Counted in reference pictures, which skip pictures are not, and
+   * below max_frame_num, which a cycle longer than the IDR period would
+   * pass: the IDR recovers such a stream first anyway. */
+  msg->payload.recovery_point.recovery_frame_cnt =
+      MIN (self->ir.cycle_size - 1, self->gop.max_frame_num - 1);
+  ret = gst_h264_bit_writer_sei (msg_list, TRUE, packed_sei, &sei_size);
+  g_array_unref (msg_list);
+
+  if (ret != GST_H264_BIT_WRITER_OK
+      || !gst_va_encoder_add_packed_header (base->encoder, frame->base.picture,
+          VAEncPackedHeaderRawData, packed_sei, sei_size * 8, FALSE))
+    GST_WARNING_OBJECT (self, "Failed to add the recovery point SEI");
+}
+
 static gboolean
 _encode_one_frame (GstVaH264Enc * self, GstVideoCodecFrame * gst_frame)
 {
@@ -3217,6 +3273,7 @@ _encode_one_frame (GstVaH264Enc * self, GstVideoCodecFrame * gst_frame)
   guint slice_of_mbs, slice_mod_mbs, slice_start_mb, slice_mbs;
   gint i;
   GstVaH264EncFrame *frame;
+  gboolean recovery_point = FALSE;
 
   g_return_val_if_fail (gst_frame, FALSE);
 
@@ -3357,9 +3414,10 @@ _encode_one_frame (GstVaH264Enc * self, GstVideoCodecFrame * gst_frame)
    * predicts from the same picture as the skip picture did. */
   if (frame->type == GST_H264_I_SLICE) {
     gst_va_intra_refresh_restart (&self->ir);
-  } else if (frame->type == GST_H264_P_SLICE
-      && !gst_va_intra_refresh_add (&self->ir, base, frame->base.picture)) {
-    return FALSE;
+  } else if (frame->type == GST_H264_P_SLICE) {
+    recovery_point = gst_va_intra_refresh_cycle_starts (&self->ir);
+    if (!gst_va_intra_refresh_add (&self->ir, base, frame->base.picture))
+      return FALSE;
   }
 
   _fill_pps (&pic_param, &self->sequence_hdr, &pps);
@@ -3370,6 +3428,10 @@ _encode_one_frame (GstVaH264Enc * self, GstVideoCodecFrame * gst_frame)
       && frame->type == GST_H264_I_SLICE
       && !_add_picture_header (self, frame, &pps))
     return FALSE;
+
+  /* Not fatal either: without it a decoder waits for the next IDR. */
+  if (recovery_point)
+    _add_recovery_point (self, frame, &pps);
 
   if (self->cc) {
     /* CC errors are not fatal */
