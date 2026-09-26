@@ -1599,6 +1599,28 @@ gst_va_intra_refresh_restart (GstVaIntraRefresh * ir)
   ir->index = 0;
 }
 
+/* The smallest cpb-size, in kbits, that is not taken as a mistake and
+ * replaced by the default. An I picture costs several average pictures,
+ * so without intra refresh the CPB is kept at half a second or more.
+ * With rolling intra refresh the P pictures share the intra cost evenly
+ * and I pictures come only at key-int-max, so a CPB of a few pictures
+ * holds the stream, which is what keeps the latency of a link low; those
+ * rare I pictures are squeezed into it at a coarse QP. Less than one
+ * picture's share of the bitrate holds no picture. The application rate
+ * control takes the CPB as its buffer, see PREDICTION_MARGIN in
+ * gstvaratecontrol.c. */
+guint
+gst_va_base_enc_min_cpb_size (GstVaBaseEnc * base, guint max_bitrate,
+    gboolean intra_refresh)
+{
+  if (!intra_refresh)
+    return max_bitrate / 2;
+
+  return gst_util_uint64_scale_int_ceil (max_bitrate,
+      GST_VIDEO_INFO_FPS_D (&base->in_info),
+      GST_VIDEO_INFO_FPS_N (&base->in_info));
+}
+
 void
 gst_va_base_enc_add_codec_tag (GstVaBaseEnc * base, const gchar * codec_name)
 {

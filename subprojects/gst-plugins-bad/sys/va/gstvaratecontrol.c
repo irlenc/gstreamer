@@ -57,6 +57,13 @@
 /* A predicted picture must leave this much of the buffer free, the
  * prediction can be off. */
 #define OVERFLOW_LEVEL 0.9
+/* A picture can cost more than predicted by a share of its own size,
+ * which the free tenth of a buffer of many pictures covers. A buffer of
+ * a few pictures, as intra refresh allows for a low latency link, has
+ * less room than one picture's error, so the prediction carries a
+ * margin of its own: without it, a picture over its prediction
+ * overflows such a buffer and the next one is forced several QP up. */
+#define PREDICTION_MARGIN 1.5
 /* A fullness error is paid back with this time constant. */
 #define FEEDBACK_SECONDS 0.5
 #define MIN_TARGET_FRACTION 0.1
@@ -229,8 +236,8 @@ gst_va_rate_control_pick (GstVaRateControl * rc, GstVaRcFrameType type,
   }
 
   qp = CLAMP (qp, (gint) rc->min_qp, (gint) rc->max_qp);
-  while (qp < (gint) rc->max_qp
-      && rc->fullness + _predict_bits (log_complexity, qp) > limit)
+  while (qp < (gint) rc->max_qp && rc->fullness
+      + PREDICTION_MARGIN * _predict_bits (log_complexity, qp) > limit)
     qp++;
 
   predicted = _predict_bits (log_complexity, qp);

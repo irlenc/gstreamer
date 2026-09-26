@@ -3481,7 +3481,9 @@ _h265_calculate_bitrate_hrd (GstVaH265Enc * self)
   GST_DEBUG_OBJECT (self, "Target bitrate: %u bits/sec", bitrate_bits);
   self->rc.target_bitrate_bits = bitrate_bits;
 
-  if (self->rc.cpb_size > 0 && self->rc.cpb_size < (self->rc.max_bitrate / 2)) {
+  if (self->rc.cpb_size > 0 && self->rc.cpb_size <
+      gst_va_base_enc_min_cpb_size (GST_VA_BASE_ENC (self),
+          self->rc.max_bitrate, self->ir.mode != 0)) {
     GST_INFO_OBJECT (self, "Too small cpb_size: %d", self->rc.cpb_size);
     self->rc.cpb_size = 0;
   }
@@ -5049,6 +5051,7 @@ gst_va_h265_enc_reconfig (GstVaBaseEnc * base)
       base->width, base->height, self->ctu_width, self->ctu_height,
       GST_TIME_ARGS (base->frame_duration));
 
+  /* Before the rate control: the CPB can be smaller with it. */
   _h265_ensure_intra_refresh (self);
 
   if (!_h265_ensure_rate_control (self))
