@@ -38,7 +38,11 @@
  *
  * Nothing here assumes that a picture's coded size is known before the
  * next one is decided: a decision adds the predicted size to the
- * fullness, and the coded size, whenever it arrives, replaces it. */
+ * fullness, and the coded size, whenever it arrives, replaces it. When
+ * a coded size moves the complexity model, the pictures still in
+ * flight are predicted again with it, so an encoder that keeps several
+ * pictures queued learns about a harder scene at the first coded size
+ * rather than one queue later. */
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
@@ -64,8 +68,12 @@
  * margin of its own: without it, a picture over its prediction
  * overflows such a buffer and the next one is forced several QP up. */
 #define PREDICTION_MARGIN 1.5
-/* A fullness error is paid back with this time constant. */
+/* A fullness error is paid back with this time constant, or over half
+ * the buffer when the buffer is shorter: feedback slower than the buffer
+ * leaves the overflow guard alone to control a buffer of a few pictures,
+ * which it does in jumps. */
 #define FEEDBACK_SECONDS 0.5
+#define FEEDBACK_BUFFER_SHARE 0.5
 #define MIN_TARGET_FRACTION 0.1
 /* Largest QP change between consecutive P pictures that the buffer
  * does not force. */
@@ -122,7 +130,8 @@ _target_bits (const GstVaRateControl * rc)
 {
   gdouble budget = _drain (rc) * rc->divisor;
   gdouble level = rc->buffer_size * TARGET_LEVEL;
-  gdouble horizon = MAX (1.0, rc->fps * FEEDBACK_SECONDS);
+  gdouble horizon = MAX (1.0, MIN (rc->fps * FEEDBACK_SECONDS,
+          FEEDBACK_BUFFER_SHARE * rc->buffer_size / _drain (rc)));
   gdouble target = budget;
 
   if (rc->intra_period > 1 && rc->ticks_since_intra < rc->intra_period) {
@@ -257,6 +266,7 @@ gst_va_rate_control_pick (GstVaRateControl * rc, GstVaRcFrameType type,
 
   rc->last_qp[type] = qp;
   _add_bits (rc, predicted - _drain (rc));
+  rc->in_flight += predicted;
   rc->ticks_since_intra++;
 }
 
@@ -273,17 +283,23 @@ void
 gst_va_rate_control_update (GstVaRateControl * rc, const GstVaRcFrame * frame,
     guint bits)
 {
-  gdouble observed, error, alpha;
+  gdouble observed, error, alpha, predicted, before;
 
   if (!frame->valid)
     return;
 
-  _add_bits (rc, bits - frame->predicted_bits);
+  /* What the fullness holds for this picture: its prediction, moved
+   * with the model since it was made. */
+  predicted = frame->predicted_bits *
+      exp2 (rc->log_complexity_p - frame->log_complexity_p);
+  _add_bits (rc, bits - predicted);
+  rc->in_flight = MAX (0.0, rc->in_flight - predicted);
 
   if (frame->type == GST_VA_RC_FRAME_I && frame->intra_count == rc->intra_count) {
-    rc->intra_excess = MAX (0.0, rc->intra_excess + bits -
-        frame->predicted_bits);
+    rc->intra_excess = MAX (0.0, rc->intra_excess + bits - predicted);
   }
+
+  before = rc->log_complexity_p;
 
   observed = log2 (MAX (bits, 1)) + frame->qp / QP_PER_OCTAVE;
 
@@ -319,4 +335,11 @@ gst_va_rate_control_update (GstVaRateControl * rc, const GstVaRcFrame * frame,
   }
 
   rc->seen[frame->type] = TRUE;
+
+  if (rc->in_flight > 0.0 && rc->log_complexity_p != before) {
+    gdouble scale = exp2 (rc->log_complexity_p - before);
+
+    _add_bits (rc, rc->in_flight * (scale - 1.0));
+    rc->in_flight *= scale;
+  }
 }
